@@ -86,25 +86,17 @@ func pollForUpdate(ctx context.Context, cfg selfupdate.Config,
 	interval time.Duration, logger log.Logger) int {
 
 	for {
-		available, err := selfupdate.CheckForUpdate(ctx, cfg)
+		available, manifest, err := selfupdate.CheckForUpdate(ctx, cfg)
 		switch {
 		case err != nil:
 			level.Warn(logger).Log("msg", "check failed", "err", err)
-		case !available:
-			level.Debug(logger).Log("msg", "no update")
+		case available:
+			level.Info(logger).Log("msg", "applying update")
+			if err := selfupdate.ApplyUpdate(ctx, cfg, manifest); err != nil {
+				level.Error(logger).Log("msg", "apply update failed", "err", err)
+			}
 		default:
-			if err := selfupdate.ApplyUpdate(ctx, cfg); err != nil {
-				level.Error(logger).Log("msg", "apply failed", "err", err)
-				break
-			}
-			level.Info(logger).Log("msg", "update applied")
-
-			if err := selfupdate.Relaunch(cfg.TargetPath, os.Args); err != nil {
-				level.Warn(logger).Log("msg", "relaunch failed, continuing", "err", err)
-				break
-			}
-			level.Info(logger).Log("msg", "exiting for successor")
-			return exitOK
+			level.Info(logger).Log("msg", "no update available")
 		}
 
 		select {
