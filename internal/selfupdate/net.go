@@ -24,7 +24,7 @@ func fetchBytes(ctx context.Context, client *http.Client, rawURL string, max int
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, classify(ClassInternal, op, err)
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	// Release buckets sit behind CDNs that will happily serve a cached manifest
 	// long after a release has been pulled.
@@ -32,14 +32,14 @@ func fetchBytes(ctx context.Context, client *http.Client, rawURL string, max int
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, classify(ClassNetwork, op, err)
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		// Includes 404: a missing signature file is a failure, never a licence
 		// to treat the manifest as unsigned.
-		return nil, classifyf(ClassNetwork, op, "unexpected status %s", resp.Status)
+		return nil, fmt.Errorf("%s: unexpected status %s", op, resp.Status)
 	}
 
 	// Read one byte past the cap so an oversized body is detected rather than
@@ -47,22 +47,22 @@ func fetchBytes(ctx context.Context, client *http.Client, rawURL string, max int
 	// covers and surface as a confusing signature failure.
 	data, err := io.ReadAll(io.LimitReader(resp.Body, max+1))
 	if err != nil {
-		return nil, classify(ClassNetwork, op, err)
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	if int64(len(data)) > max {
-		return nil, classifyf(ClassManifestInvalid, op, "response exceeds the %d byte limit", max)
+		return nil, fmt.Errorf("%s: response exceeds the %d byte limit", op, max)
 	}
 	return data, nil
 }
 
 // requireHTTPS enforces transport security on a URL. The only waiver is
 // SELFUPDATE_ALLOW_HTTP; see allowHTTP for why that is development-only.
-func requireHTTPS(rawURL string, what string, class ErrorClass) error {
+func requireHTTPS(rawURL string, what string) error {
 	op := "validate " + what + " URL"
 
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return classifyf(class, op, "%q is not a valid URL: %v", rawURL, err)
+		return fmt.Errorf("%s: %q is not a valid URL: %v", op, rawURL, err)
 	}
 	if u.Scheme == "https" {
 		return nil
@@ -70,7 +70,7 @@ func requireHTTPS(rawURL string, what string, class ErrorClass) error {
 	if allowHTTP() {
 		return nil
 	}
-	return classifyf(class, op, "%s URL uses scheme %q; HTTPS is required", what, u.Scheme)
+	return fmt.Errorf("%s: %s URL uses scheme %q; HTTPS is required", op, what, u.Scheme)
 }
 
 // urlPath returns just the path component of a URL, for error messages. Full
@@ -97,7 +97,7 @@ func downloadArtifact(ctx context.Context, art PlatformArtifact, destPath string
 	art.SHA256 = strings.ToLower(strings.TrimSpace(art.SHA256))
 
 	if err := art.validate(); err != nil {
-		return classify(ClassManifestInvalid, op, err)
+		return fmt.Errorf("%s: %w", op, err)
 	}
 
 	attempts := defaultFetchAttempts
@@ -110,7 +110,7 @@ func downloadArtifact(ctx context.Context, art PlatformArtifact, destPath string
 		// Checked before sleeping, so a cancelled context ends the call now
 		// rather than after the rest of the schedule.
 		if err := ctx.Err(); err != nil {
-			return classify(ClassNetwork, op, err)
+			return fmt.Errorf("%s: %w", op, err)
 		}
 		if attempt > 1 {
 			delay := backoffDelay(attempt-1, base, rnd)
@@ -118,7 +118,7 @@ func downloadArtifact(ctx context.Context, art PlatformArtifact, destPath string
 			select {
 			case <-ctx.Done():
 				timer.Stop()
-				return classify(ClassNetwork, op, ctx.Err())
+				return fmt.Errorf("%s: %w", op, ctx.Err())
 			case <-timer.C:
 			}
 		}
@@ -132,7 +132,7 @@ func downloadArtifact(ctx context.Context, art PlatformArtifact, destPath string
 			return err
 		}
 	}
-	return classifyf(ClassNetwork, op, "gave up after %d attempts: %w", attempts, lastErr)
+	return fmt.Errorf("%s: gave up after %d attempts: %w", op, attempts, lastErr)
 }
 
 // downloadAttempt is one pass of downloadArtifact's retry loop. retry reports
@@ -145,7 +145,7 @@ func downloadAttempt(ctx context.Context, art PlatformArtifact, destPath string)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, art.URL, nil)
 	if err != nil {
-		return false, classify(ClassInternal, op, err)
+		return false, fmt.Errorf("%s: %w", op, err)
 	}
 
 	req.Header.Set("Accept-Encoding", "identity")
@@ -156,9 +156,9 @@ func downloadAttempt(ctx context.Context, art PlatformArtifact, destPath string)
 	resp, err := defaultDownloadClient.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
-			return false, classify(ClassNetwork, op, ctx.Err())
+			return false, fmt.Errorf("%s: %w", op, ctx.Err())
 		}
-		return true, classify(ClassNetwork, op, err)
+		return true, fmt.Errorf("%s: %w", op, err)
 	}
 	defer resp.Body.Close()
 
@@ -175,19 +175,17 @@ func downloadAttempt(ctx context.Context, art PlatformArtifact, destPath string)
 		if offset == 0 {
 			// We did not ask for a range, so repeating the request would get
 			// the same answer.
-			return false, classifyf(ClassNetwork, op, "server rejected an unranged request with %s", resp.Status)
+			return false, fmt.Errorf("%s: server rejected an unranged request with %s", op, resp.Status)
 		}
-		return true, classifyf(ClassNetwork, op,
-			"server rejected resume at byte %d with %s; discarded the partial", offset, resp.Status)
+		return true, fmt.Errorf("%s: server rejected resume at byte %d with %s; discarded the partial", op, offset, resp.Status)
 	default:
-		return retryableHTTPStatus(resp.StatusCode), classifyf(ClassNetwork, op, "unexpected status %s", resp.Status)
+		return retryableHTTPStatus(resp.StatusCode), fmt.Errorf("%s: unexpected status %s", op, resp.Status)
 	}
 
 	remaining := art.Size - offset
 	if resp.ContentLength >= 0 && resp.ContentLength != remaining {
 		_ = os.Remove(destPath)
-		return false, classifyf(ClassHashMismatch, op,
-			"server offers %d bytes from offset %d, manifest says %d", resp.ContentLength, offset, remaining)
+		return false, fmt.Errorf("%s: server offers %d bytes from offset %d, manifest says %d", op, resp.ContentLength, offset, remaining)
 	}
 
 	h, err := seedHashFromPrefix(destPath, offset)
@@ -201,23 +199,22 @@ func downloadAttempt(ctx context.Context, art PlatformArtifact, destPath string)
 	switch {
 	case writeErr != nil:
 		// Out of space or no permission to write here: neither improves on a
-		// retry, and both need to be reported as themselves rather than as a
-		// network blip.
-		return false, classify(ClassOf(writeErr), op, writeErr)
+		// retry.
+		return false, fmt.Errorf("%s: %w", op, writeErr)
 	case readErr != nil:
 		// Interrupted mid-stream. Keep the partial — resuming it is the whole
 		// point of ranged requests.
-		return true, classify(ClassNetwork, op, readErr)
+		return true, fmt.Errorf("%s: %w", op, readErr)
 	case total != art.Size:
 		// The body ended cleanly but short (the cap above makes overshoot
 		// impossible). Also resumable.
-		return true, classifyf(ClassNetwork, op, "body ended after %d of %d bytes", total, art.Size)
+		return true, fmt.Errorf("%s: body ended after %d of %d bytes", op, total, art.Size)
 	}
 
 	sum := hex.EncodeToString(h.Sum(nil))
 	if !strings.EqualFold(sum, art.SHA256) {
 		_ = os.Remove(destPath)
-		return false, classifyf(ClassHashMismatch, op, "sha256 %s does not match manifest %s", sum, art.SHA256)
+		return false, fmt.Errorf("%s: sha256 %s does not match manifest %s", op, sum, art.SHA256)
 	}
 	return false, nil
 }
@@ -268,9 +265,9 @@ func seedHashFromPrefix(path string, n int64) (hash.Hash, error) {
 // pass, so verification costs no second read and the artifact is never held in
 // memory.
 //
-// Read and write failures are returned separately because they classify
-// differently: a truncated body is a resumable network problem, a failed write
-// is a full disk or a permissions problem.
+// Read and write failures are returned separately because the caller treats
+// them differently: a truncated body is a resumable network problem, a failed
+// write (full disk, permissions) is not.
 func writeArtifactBody(destPath string, offset int64, body io.Reader, h hash.Hash) (written int64, readErr, writeErr error) {
 	flags := os.O_CREATE | os.O_WRONLY
 	if offset > 0 {

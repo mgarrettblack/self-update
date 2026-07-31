@@ -47,49 +47,21 @@ func run(ctx context.Context, stdout io.Writer) int {
 		return exitUsageError
 	}
 
-	// Step 1: a marker that survived means the last update never reported
-	// healthy. Before any work that could itself crash.
-	res, err := selfupdate.CheckStartup(cfg)
-	if err != nil {
-		level.Error(logger).Log("msg", "startup check", "err", err)
-	}
-	if res.Reverted {
-		Rollback(cfg, res, err, logger)
+	// Step 1: check if previous update was successful
+	if !selfupdate.UpdateSuccessful(cfg) {
+		level.Error(logger).Log("msg", "previous update failed, rolling back")
+		selfupdate.Rollback(cfg)
 	}
 
-	// Step 2: the real startup work — everything that can fail.
+	// Step 2: start the actual application
 	if err := launchApp(logger); err != nil {
 		level.Error(logger).Log("msg", "app startup failed", "err", err)
 		return exitRuntimeError
 	}
+	cleanup(cfg, logger)
 
-	// Step 3: and not before. Clears the marker, drops the retained .old.
-	if err := selfupdate.MarkHealthy(cfg); err != nil {
-		level.Error(logger).Log("msg", "mark healthy", "err", err)
-	}
-	if err := selfupdate.RemoveOld(cfg.TargetPath); err != nil {
-		level.Error(logger).Log("msg", "remove old binary", "err", err)
-	}
-
-	// Step 4: poll.
+	// Step 3: poll for new updates
 	return pollForUpdate(ctx, cfg, interval, logger)
-}
-
-func Rollback(cfg selfupdate.Config, res selfupdate.StartupResult, checkErr error, logger log.Logger) {
-	// Marker is nil on the unparseable-marker path: there was no attempt
-	// count to trust, so the revert fired without a version pair to report.
-	from, to := "", ""
-	if res.Marker != nil {
-		from, to = res.Marker.FromVersion, res.Marker.ToVersion
-	}
-	level.Warn(logger).Log("msg", "update rolled back", "from", from, "to", to)
-
-	if checkErr != nil {
-		level.Error(logger).Log("msg", "revert incomplete, not relaunching",
-			"target", cfg.TargetPath)
-	} else if err := selfupdate.Relaunch(cfg.TargetPath, os.Args); err != nil {
-		level.Error(logger).Log("msg", "relaunch after rollback", "err", err)
-	}
 }
 
 // launchApp stands in for the application's real startup: whatever must succeed
@@ -102,6 +74,15 @@ func launchApp(logger log.Logger) error {
 	return nil
 }
 
+func cleanup(cfg selfupdate.Config, logger log.Logger) {
+	if err := os.Remove(cfg.TargetPath + selfupdate.DownloadSuffix); err != nil && !os.IsNotExist(err) {
+		level.Warn(logger).Log("msg", "cleanup stale download artifact failed", "err", err)
+	}
+	if err := os.Remove(cfg.TargetPath + selfupdate.StagedSuffix); err != nil && !os.IsNotExist(err) {
+		level.Warn(logger).Log("msg", "cleanup stale staged artifact failed", "err", err)
+	}
+}
+
 func pollForUpdate(ctx context.Context, cfg selfupdate.Config,
 	interval time.Duration, logger log.Logger) int {
 
@@ -109,30 +90,20 @@ func pollForUpdate(ctx context.Context, cfg selfupdate.Config,
 		d, err := selfupdate.CheckForUpdate(ctx, cfg)
 		switch {
 		case err != nil:
-			// Never fatal: an unreachable release host must not take down the
-			// application it exists to maintain.
-			level.Warn(logger).Log("msg", "check failed",
-				"class", selfupdate.ClassOf(err), "err", err)
+			level.Warn(logger).Log("msg", "check failed", "err", err)
 		case !d.UpdateAvailable:
-			level.Debug(logger).Log("msg", "no update", "reason", d.Reason)
+			level.Debug(logger).Log("msg", "no update")
 		default:
 			if err := selfupdate.ApplyUpdate(ctx, cfg, d); err != nil {
-				level.Error(logger).Log("msg", "apply failed",
-					"class", selfupdate.ClassOf(err), "err", err)
+				level.Error(logger).Log("msg", "apply failed", "err", err)
 				break
 			}
-			level.Info(logger).Log("msg", "update applied",
-				"from", d.CurrentVersion, "to", d.Manifest.Version)
+			level.Info(logger).Log("msg", "update applied", "from", d.CurrentVersion, "to", d.Manifest.Version)
 
 			if err := selfupdate.Relaunch(cfg.TargetPath, os.Args); err != nil {
-				// The swap succeeded and the marker is in place; we just could
-				// not hand over. Staying on the old image beats exiting, and
-				// the next start picks up the new binary.
 				level.Warn(logger).Log("msg", "relaunch failed, continuing", "err", err)
 				break
 			}
-			// Unix never reaches here — Relaunch replaced the image. On Windows
-			// the successor is running and this process must exit.
 			level.Info(logger).Log("msg", "exiting for successor")
 			return exitOK
 		}
@@ -145,8 +116,6 @@ func pollForUpdate(ctx context.Context, cfg selfupdate.Config,
 	}
 }
 
-// nextInterval returns the base interval plus jitter, to spread load across
-// installs. math/rand is correct here: nothing about it is a security decision.
 func nextInterval(base time.Duration) time.Duration {
 	if base <= 0 {
 		base = defaultPollInterval
@@ -154,10 +123,7 @@ func nextInterval(base time.Duration) time.Duration {
 	return base + time.Duration(rand.Float64()*pollJitterFraction*float64(base))
 }
 
-// setup loads the dotenv and resolves it into the library's Config, returning
-// the base poll interval alongside it.
-func setup(logger log.Logger) (selfupdate.Config, time.Duration, error) {
-	warnIfHTTPAllowed(logger)
+func setup() (selfupdate.Config, time.Duration, error) {
 
 	c, err := loadConfig(defaultEnvPath)
 	if err != nil {
@@ -181,20 +147,6 @@ func setup(logger log.Logger) (selfupdate.Config, time.Duration, error) {
 func newLogger(stdout io.Writer) log.Logger {
 	logger := level.NewFilter(log.NewLogfmtLogger(stdout), level.AllowAll())
 	return log.With(logger, "ts", log.DefaultTimestampUTC)
-}
-
-// warnIfHTTPAllowed makes the library's SELFUPDATE_ALLOW_HTTP escape hatch
-// visible in the log. It reads through a viper instance of its own so that
-// binding the environment cannot change how the dotenv keys resolve.
-func warnIfHTTPAllowed(logger log.Logger) {
-	env := viper.New()
-	env.AutomaticEnv()
-	if env.GetBool(allowHTTPKey) {
-		level.Warn(logger).Log("msg",
-			"plaintext HTTP permitted for manifest and artifact fetches; "+
-				"an attacker who can rewrite responses controls what this process runs next",
-			"env", "SELFUPDATE_ALLOW_HTTP")
-	}
 }
 
 func loadConfig(path string) (config, error) {

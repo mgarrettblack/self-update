@@ -42,23 +42,23 @@ func NewConfig(manifestURL, targetPath, stateDir string) (Config, error) {
 	const op = "configure updater"
 
 	if strings.TrimSpace(manifestURL) == "" {
-		return Config{}, classifyf(ClassInternal, op, "no manifest URL configured")
+		return Config{}, fmt.Errorf("%s: no manifest URL configured", op)
 	}
 	if strings.TrimSpace(stateDir) == "" {
-		return Config{}, classifyf(ClassInternal, op, "no state directory configured")
+		return Config{}, fmt.Errorf("%s: no state directory configured", op)
 	}
 
 	path := targetPath
 	if path == "" {
 		exe, err := os.Executable()
 		if err != nil {
-			return Config{}, classify(ClassInternal, op, err)
+			return Config{}, fmt.Errorf("%s: %w", op, err)
 		}
 		path = exe
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return Config{}, classify(ClassInternal, op, err)
+		return Config{}, fmt.Errorf("%s: %w", op, err)
 	}
 	target := abs
 	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
@@ -83,31 +83,18 @@ type Decision struct {
 	Manifest        *Manifest
 	Artifact        PlatformArtifact
 	UpdateAvailable bool
-
-	// Reason explains the outcome in one line, for logs. It is always set.
-	Reason string
-
-	CurrentVersion string
+	CurrentVersion  string
 }
 
-// checkClient is shared across cycles so connection pooling and TLS session
-// resumption survive a poll loop. Its timeout bounds the entire manifest
-// fetch: a check is a few kilobytes and must not stall the caller's loop.
 var checkClient = &http.Client{Timeout: defaultCheckTimeout}
 
-// CheckForUpdate fetches, verifies and parses the manifest, then decides
-// whether a newer release applies to this install.
-//
-// A nil error with UpdateAvailable false is a normal outcome, not a failure —
-// Reason says which one. An error means the check itself could not be
-// completed, and the caller should treat it as transient rather than fatal.
 func CheckForUpdate(ctx context.Context, cfg Config) (*Decision, error) {
 	const op = "check for update"
 
 	if strings.TrimSpace(cfg.ManifestURL) == "" {
-		return nil, classify(ClassInternal, op, errors.New("manifest URL is empty"))
+		return nil, fmt.Errorf("%s: manifest URL is empty", op)
 	}
-	if err := requireHTTPS(cfg.ManifestURL, "manifest", ClassInternal); err != nil {
+	if err := requireHTTPS(cfg.ManifestURL, "manifest"); err != nil {
 		return nil, err
 	}
 
@@ -116,7 +103,7 @@ func CheckForUpdate(ctx context.Context, cfg Config) (*Decision, error) {
 	// could talk this process into installing an older release.
 	current := Version
 	if _, err := parseSemver(current); err != nil {
-		return nil, classifyf(ClassInternal, op, "running version %q is not valid semver: %v", current, err)
+		return nil, fmt.Errorf("%s: running version %q is not valid semver: %v", op, current, err)
 	}
 
 	body, err := fetchBytes(ctx, checkClient, cfg.ManifestURL, defaultMaxManifestBytes)
@@ -133,7 +120,7 @@ func CheckForUpdate(ctx context.Context, cfg Config) (*Decision, error) {
 
 	newer, err := IsNewer(m.Version, current)
 	if err != nil {
-		return nil, classify(ClassManifestInvalid, op, err)
+		return nil, fmt.Errorf("%s: %w", op, err)
 	}
 	if !newer {
 		// Covers both "same version" and a rolled-back manifest advertising an
@@ -148,7 +135,7 @@ func CheckForUpdate(ctx context.Context, cfg Config) (*Decision, error) {
 		d.Reason = fmt.Sprintf("release %s publishes no artifact for %s", m.Version, platform)
 		return d, nil
 	}
-	if err := requireHTTPS(art.URL, "artifact", ClassManifestInvalid); err != nil {
+	if err := requireHTTPS(art.URL, "artifact"); err != nil {
 		return nil, err
 	}
 
@@ -173,14 +160,14 @@ func CheckForUpdate(ctx context.Context, cfg Config) (*Decision, error) {
 func ApplyUpdate(ctx context.Context, cfg Config, d *Decision) error {
 	target := cfg.TargetPath
 	dir := filepath.Dir(target)
-	compressed := target + downloadSuffix
-	staged := target + stagedSuffix
+	compressed := target + DownloadSuffix
+	staged := target + StagedSuffix
 
 	// The lock covers download through swap. Two instances staging to the same
 	// paths would interleave writes into one file and produce a binary that
 	// matches no digest at all.
 	if err := os.MkdirAll(cfg.StateDir, stateDirMode); err != nil {
-		return classify(ClassOf(err), "create state directory", err)
+		return fmt.Errorf("create state directory: %w", err)
 	}
 	// Step 1: acquire the update lock — covers download through swap.
 	lock, err := AcquireLock(filepath.Join(cfg.StateDir, lockFilename))
@@ -199,8 +186,7 @@ func ApplyUpdate(ctx context.Context, cfg Config, d *Decision) error {
 	// before the first byte is requested.
 	need := d.Artifact.Size * (1 + decompressionRatioEstimate)
 	if need < d.Artifact.Size { // overflow on an absurd declared size
-		return classifyf(ClassManifestInvalid, "update",
-			"declared artifact size %d bytes is not plausible", d.Artifact.Size)
+		return fmt.Errorf("update: declared artifact size %d bytes is not plausible", d.Artifact.Size)
 	}
 	if err := ensureFreeSpace(dir, need); err != nil {
 		return err
@@ -247,10 +233,10 @@ func markerPath(cfg Config) string { return filepath.Join(cfg.StateDir, markerFi
 // the next start would revert on the strength of it.
 func markPending(cfg Config, fromVersion, toVersion string) error {
 	if cfg.StateDir == "" {
-		return classifyf(ClassInternal, "mark pending", "no state dir configured")
+		return fmt.Errorf("mark pending: no state dir configured")
 	}
 	if err := os.MkdirAll(cfg.StateDir, stateDirMode); err != nil {
-		return classify(ClassOf(err), "mark pending: create state dir", err)
+		return fmt.Errorf("mark pending: create state dir: %w", err)
 	}
 
 	m := Marker{
@@ -263,15 +249,16 @@ func markPending(cfg Config, fromVersion, toVersion string) error {
 }
 
 // CheckStartup runs once at process start, before any real startup work, and
-// reverts to the previous binary if a marker survived from an update that
-// never reached MarkHealthy. See rollback.md for the attempt-accounting
-// walkthrough and what StartupResult.Reverted means for the caller.
+// reports whether the previous update was successful: Reverted is set when a
+// marker survived from an update that never reached MarkHealthy, either
+// because it is unparseable or because it has been attempted past
+// maxStartAttempts without ever reporting healthy.
 //
-// When Reverted is set, the returned error is Rollback's: the caller learns
-// both that a revert was attempted and whether it actually succeeded.
+// CheckStartup does not itself roll anything back — that is Rollback's job.
+// The caller checks Reverted and calls Rollback when it is set.
 func CheckStartup(cfg Config) (StartupResult, error) {
 	if cfg.StateDir == "" {
-		return StartupResult{}, classifyf(ClassInternal, "check startup", "no state dir configured")
+		return StartupResult{}, fmt.Errorf("check startup: no state dir configured")
 	}
 
 	data, err := os.ReadFile(markerPath(cfg))
@@ -279,20 +266,20 @@ func CheckStartup(cfg Config) (StartupResult, error) {
 		if errors.Is(err, fs.ErrNotExist) {
 			return StartupResult{}, nil
 		}
-		return StartupResult{}, classify(ClassOf(err), "check startup: read marker", err)
+		return StartupResult{}, fmt.Errorf("check startup: read marker: %w", err)
 	}
 
 	var m Marker
 	if err := json.Unmarshal(data, &m); err != nil {
-		// Unparseable marker — there is no attempt count to trust, so revert
-		// immediately rather than guess. Marker stays nil: nothing was read
-		// that a caller could report.
-		return StartupResult{Reverted: true}, Rollback(cfg)
+		// Unparseable marker — there is no attempt count to trust, so treat
+		// this as an update that never succeeded. Marker stays nil: nothing
+		// was read that a caller could report.
+		return StartupResult{Reverted: true}, nil
 	}
 
 	m.Attempts++
 	if m.Attempts > maxStartAttempts {
-		return StartupResult{Reverted: true, Marker: &m}, Rollback(cfg)
+		return StartupResult{Reverted: true, Marker: &m}, nil
 	}
 
 	if err := writeMarker(cfg, m); err != nil {
@@ -308,12 +295,26 @@ func CheckStartup(cfg Config) (StartupResult, error) {
 // end of startup on every run, not just post-update ones.
 func MarkHealthy(cfg Config) error {
 	if cfg.StateDir == "" {
-		return classifyf(ClassInternal, "mark healthy", "no state dir configured")
+		return fmt.Errorf("mark healthy: no state dir configured")
 	}
 	if err := removeFile(markerPath(cfg)); err != nil {
-		return classify(ClassOf(err), "mark healthy", err)
+		return fmt.Errorf("mark healthy: %w", err)
 	}
 	return nil
+}
+
+// UpdateSuccessful clears the healthy marker and removes the retained .old
+// binary now that startup has completed without error. It returns false if
+// either step fails, signaling the caller should roll back rather than trust
+// a swap that could not be confirmed.
+func UpdateSuccessful(cfg Config) bool {
+	if err := MarkHealthy(cfg); err != nil {
+		return false
+	}
+	if err := RemoveOld(cfg.TargetPath); err != nil {
+		return false
+	}
+	return true
 }
 
 // Rollback puts the previous generation back and clears the marker.
@@ -322,16 +323,13 @@ func MarkHealthy(cfg Config) error {
 // silently failed restore is the most damaging state in the system: the process
 // keeps running a binary that never reported healthy, with the marker already
 // gone, so the next start will not retry.
-func Rollback(cfg Config) error {
+func Rollback(cfg Config) {
 	// Step 1: rename <TargetPath>.old back onto TargetPath.
-	restoreErr := RestoreOld(cfg.TargetPath)
+	RestoreOld(cfg.TargetPath)
 
-	// Step 2: remove the marker, unconditionally — even if step 1 failed. A
-	// marker with no .old to return to would re-trigger this path on every
-	// subsequent start.
-	clearErr := removeFile(markerPath(cfg))
+	// Step 2: remove the marker
+	removeFile(markerPath(cfg))
 
-	return errors.Join(restoreErr, clearErr)
 }
 
 // writeMarker persists m via a temp file plus rename, so a crash mid-write can
@@ -339,16 +337,16 @@ func Rollback(cfg Config) error {
 func writeMarker(cfg Config, m Marker) error {
 	data, err := json.Marshal(m)
 	if err != nil {
-		return classify(ClassInternal, "write marker", err)
+		return fmt.Errorf("write marker: %w", err)
 	}
 
 	tmp := markerPath(cfg) + ".tmp"
 	if err := os.WriteFile(tmp, data, privateFileMode); err != nil {
-		return classify(ClassOf(err), "write marker", err)
+		return fmt.Errorf("write marker: %w", err)
 	}
 	if err := os.Rename(tmp, markerPath(cfg)); err != nil {
 		_ = os.Remove(tmp)
-		return classify(ClassOf(err), "write marker: rename", err)
+		return fmt.Errorf("write marker: rename: %w", err)
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ package selfupdate
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -134,8 +135,7 @@ func applySwap(newBinary, target string) error {
 			// binary is still on disk at .old for a human (or the next run of
 			// the installer) to recover.
 			if restoreErr := os.Rename(old, target); restoreErr != nil {
-				return classifyf(ClassSwapFailed, "apply",
-					"rename staged binary failed (%v) and restoring %q failed too (%v)",
+				return fmt.Errorf("apply: rename staged binary failed (%v) and restoring %q failed too (%v)",
 					err, target, restoreErr)
 			}
 		}
@@ -164,8 +164,7 @@ func restoreOld(old, target string) error {
 	movedAside := false
 	if _, err := os.Lstat(target); err == nil {
 		if broken == "" {
-			return classifyf(ClassSwapFailed, "restore old",
-				"cannot move %q aside: a previous .broken file is still in place", target)
+			return fmt.Errorf("restore old: cannot move %q aside: a previous .broken file is still in place", target)
 		}
 		if err := os.Rename(target, broken); err != nil {
 			return swapError("restore old: rename current aside", err)
@@ -178,8 +177,7 @@ func restoreOld(old, target string) error {
 	if err := os.Rename(old, target); err != nil {
 		if movedAside {
 			if restoreErr := os.Rename(broken, target); restoreErr != nil {
-				return classifyf(ClassSwapFailed, "restore old",
-					"rename retained generation failed (%v) and putting %q back failed too (%v)",
+				return fmt.Errorf("restore old: rename retained generation failed (%v) and putting %q back failed too (%v)",
 					err, target, restoreErr)
 			}
 		}

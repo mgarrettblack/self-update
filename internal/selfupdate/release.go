@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/url"
 	"runtime"
@@ -190,8 +189,7 @@ func (m *Manifest) RolloutPercent() int {
 func (m *Manifest) Artifact(platform string) (PlatformArtifact, error) {
 	art, ok := m.Platforms[platform]
 	if !ok {
-		return PlatformArtifact{}, classifyf(ClassManifestInvalid, "select artifact",
-			"release %s has no artifact for platform %q", m.Version, platform)
+		return PlatformArtifact{}, fmt.Errorf("select artifact: release %s has no artifact for platform %q", m.Version, platform)
 	}
 	return art, nil
 }
@@ -203,7 +201,7 @@ func PlatformKey() string { return runtime.GOOS + "-" + runtime.GOARCH }
 func ParseManifest(b []byte) (*Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, classify(ClassManifestInvalid, "parse manifest", err)
+		return nil, fmt.Errorf("parse manifest: %w", err)
 	}
 	for key, art := range m.Platforms {
 		art.SHA256 = strings.ToLower(strings.TrimSpace(art.SHA256))
@@ -220,20 +218,20 @@ func (m *Manifest) Validate() error {
 	const op = "validate manifest"
 
 	if strings.TrimSpace(m.Version) == "" {
-		return classify(ClassManifestInvalid, op, errors.New("version is empty"))
+		return fmt.Errorf("%s: version is empty", op)
 	}
 	if _, err := parseSemver(m.Version); err != nil {
-		return classify(ClassManifestInvalid, op, err)
+		return fmt.Errorf("%s: %w", op, err)
 	}
 	if p := m.RolloutPercent(); p < 0 || p > 100 {
-		return classifyf(ClassManifestInvalid, op, "rollout %d is outside 0-100", p)
+		return fmt.Errorf("%s: rollout %d is outside 0-100", op, p)
 	}
 	if len(m.Platforms) == 0 {
-		return classify(ClassManifestInvalid, op, errors.New("no platforms listed"))
+		return fmt.Errorf("%s: no platforms listed", op)
 	}
 	for key, art := range m.Platforms {
 		if err := art.validate(); err != nil {
-			return classifyf(ClassManifestInvalid, op, "platform %q: %v", key, err)
+			return fmt.Errorf("%s: platform %q: %v", op, key, err)
 		}
 	}
 	return nil

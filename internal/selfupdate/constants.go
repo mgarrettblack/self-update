@@ -58,10 +58,12 @@ const (
 // build that cannot get through startup once will not get through it twice.
 const maxStartAttempts = 1
 
-// Staging-file suffixes.
+// Staging-file suffixes. Exported so callers doing their own crash-recovery
+// cleanup (e.g. a startup sweep before ApplyUpdate ever runs) can name the
+// same files ApplyUpdate stages, without a dedicated library function.
 const (
-	downloadSuffix = ".download"
-	stagedSuffix   = ".new"
+	DownloadSuffix = ".download"
+	StagedSuffix   = ".new"
 )
 
 const decompressionRatioEstimate = 4
