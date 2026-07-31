@@ -2,8 +2,6 @@ package selfupdate
 
 import (
 	"cmp"
-	"crypto/sha256"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -262,36 +260,4 @@ func (a PlatformArtifact) validate() error {
 		return fmt.Errorf("url %q has unsupported scheme %q", a.URL, u.Scheme)
 	}
 	return nil
-}
-
-// InRolloutCohort reports whether this install is in the cohort for a release
-// at the given rollout percentage.
-//
-// Crash-loop detection (see rollback.go) catches a bad update on one machine
-// after the fact; it does nothing to stop a bad release reaching the whole
-// fleet at once. Staged rollout is the other half: publish at 10%, watch the
-// telemetry, then ramp.
-//
-// Two properties make this usable, and both are tested:
-//
-//   - Deterministic in (installID, version). A client that re-rolled on every
-//     poll would drift into any cohort eventually, so a 10% rollout would reach
-//     everyone given enough hours.
-//   - Monotonic in percent. Raising the percentage only ever adds clients, so
-//     ramping a release never makes it disappear from a client that already saw
-//     it.
-//
-// Keying on the version as well as the install ID matters: keyed on the ID
-// alone, the same unlucky 10% of the fleet would be the canary for every
-// release forever.
-func InRolloutCohort(installID, releaseVersion string, percent int) bool {
-	if percent <= 0 {
-		return false
-	}
-	if percent >= 100 {
-		return true
-	}
-	sum := sha256.Sum256([]byte(installID + "|" + releaseVersion))
-	bucket := binary.BigEndian.Uint64(sum[:8]) % 100
-	return bucket < uint64(percent)
 }

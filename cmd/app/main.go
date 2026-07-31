@@ -1,9 +1,4 @@
 // Command app is a demonstration application that keeps itself up to date.
-//
-// It exists to document the one call ordering the library cannot enforce for
-// itself: startup check, then the real startup work, then MarkHealthy, and only
-// then the poll loop. The four steps in run are numbered for that reason —
-// moving MarkHealthy ahead of the work that can fail defeats rollback entirely.
 package main
 
 import (

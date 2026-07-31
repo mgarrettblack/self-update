@@ -4,10 +4,10 @@ package selfupdate
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -81,13 +81,13 @@ var linkFile = os.Link
 // contrast the Windows applySwap below.
 func applySwap(newBinary, target string) error {
 	if err := os.Chmod(newBinary, binaryMode); err != nil {
-		return swapError("apply: chmod staged binary", err)
+		return fmt.Errorf("apply: chmod staged binary: %w", err)
 	}
 	if err := retainPrevious(target, OldPath(target)); err != nil {
 		return err
 	}
 	if err := os.Rename(newBinary, target); err != nil {
-		return swapError("apply: rename", err)
+		return fmt.Errorf("apply: rename: %w", err)
 	}
 	return nil
 }
@@ -100,16 +100,16 @@ func retainPrevious(target, old string) error {
 			// any stale .old so a later rollback cannot resurrect a binary from
 			// an unrelated generation.
 			if err := os.Remove(old); err != nil && !errors.Is(err, fs.ErrNotExist) {
-				return swapError("apply: remove stale old", err)
+				return fmt.Errorf("apply: remove stale old: %w", err)
 			}
 			return nil
 		}
-		return swapError("apply: stat target", err)
+		return fmt.Errorf("apply: stat target: %w", err)
 	}
 
 	// os.Link fails with EEXIST if old is still there from the previous update.
 	if err := os.Remove(old); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return swapError("apply: remove stale old", err)
+		return fmt.Errorf("apply: remove stale old: %w", err)
 	}
 
 	if err := linkFile(target, old); err == nil {
@@ -121,7 +121,7 @@ func retainPrevious(target, old string) error {
 	// possible, so fall back to a copy: slower and briefly uses twice the
 	// space, but the disk-space preflight already accounted for a second copy.
 	if err := copyFile(target, old, binaryMode); err != nil {
-		return swapError("apply: retain previous generation", err)
+		return fmt.Errorf("apply: retain previous generation: %w", err)
 	}
 	return nil
 }
@@ -131,10 +131,10 @@ func retainPrevious(target, old string) error {
 // (same reasoning as applySwap).
 func restoreOld(old, target string) error {
 	if err := os.Rename(old, target); err != nil {
-		return swapError("restore old: rename", err)
+		return fmt.Errorf("restore old: rename: %w", err)
 	}
 	if err := os.Chmod(target, binaryMode); err != nil {
-		return swapError("restore old: chmod", err)
+		return fmt.Errorf("restore old: chmod: %w", err)
 	}
 	return nil
 }
@@ -164,27 +164,4 @@ func copyFile(src, dst string, mode fs.FileMode) error {
 		return err
 	}
 	return out.Close()
-}
-
-// RelaunchReplacesProcess reports whether Relaunch replaces the current
-// process image (unix) or spawns a new process the caller must exit after
-// (windows). Callers need to know whether Relaunch returns on success.
-//
-// On unix it is true: Relaunch execs, so a nil return is impossible and any
-// code after a successful Relaunch is dead.
-const RelaunchReplacesProcess = true
-
-func init() { execProcess = execReplace }
-
-// execReplace replaces the running process image via execve(2).
-//
-// This is preferred over fork+exec on unix because it preserves the PID, the
-// controlling terminal, open standard streams, and the parent's place in any
-// process group or supervisor's bookkeeping. Spawning a child and exiting the
-// parent instead would make an init system (systemd, launchd) see the service
-// as having exited, and would briefly leave two processes alive.
-//
-// It returns only on failure.
-func execReplace(path string, argv, env []string) error {
-	return syscall.Exec(path, argv, env)
 }

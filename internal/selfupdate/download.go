@@ -74,12 +74,13 @@ func urlPath(rawURL string) string {
 // reuse survive across polls.
 var defaultDownloadClient = &http.Client{Timeout: defaultFetchTimeout}
 
-// downloadArtifact fetches art into destPath and verifies SHA-256 over the
-// bytes written, retrying a resumable failure up to defaultFetchAttempts times.
-// It returns nil only when the file on disk matches the digest the manifest
-// advertises, which is the precondition DecompressFile and Apply rely on.
+// opDownloadArtifact labels every error downloadArtifact and downloadAttempt
+// produce, so failures anywhere in the retry loop are attributable to one op.
+const opDownloadArtifact = "download artifact"
+
+// downloadArtifact fetches artifact called out in manifest
 func downloadArtifact(ctx context.Context, art PlatformArtifact, destPath string) error {
-	const op = "download artifact"
+	const op = opDownloadArtifact
 
 	art.SHA256 = strings.ToLower(strings.TrimSpace(art.SHA256))
 
@@ -90,7 +91,7 @@ func downloadArtifact(ctx context.Context, art PlatformArtifact, destPath string
 	attempts := defaultFetchAttempts
 	base := defaultBaseBackoff
 
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	rnd := rand.New(rand.NewSource(rand.Int63()))
 
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
@@ -126,7 +127,7 @@ func downloadArtifact(ctx context.Context, art PlatformArtifact, destPath string
 // whether the failure is worth another attempt; a nil error means destPath holds
 // the full artifact and its digest matched.
 func downloadAttempt(ctx context.Context, art PlatformArtifact, destPath string) (retry bool, err error) {
-	const op = "download artifact"
+	const op = opDownloadArtifact
 
 	offset := resumeOffset(destPath, art.Size)
 
@@ -149,24 +150,9 @@ func downloadAttempt(ctx context.Context, art PlatformArtifact, destPath string)
 	}
 	defer resp.Body.Close()
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-		offset = 0
-	case http.StatusPartialContent:
-		if start, ok := contentRangeStart(resp.Header.Get("Content-Range")); !ok || start != offset {
-			offset = 0
-		}
-	case http.StatusRequestedRangeNotSatisfiable:
-		// This server will not serve our prefix; it is dead weight now.
-		_ = os.Remove(destPath)
-		if offset == 0 {
-			// We did not ask for a range, so repeating the request would get
-			// the same answer.
-			return false, fmt.Errorf("%s: server rejected an unranged request with %s", op, resp.Status)
-		}
-		return true, fmt.Errorf("%s: server rejected resume at byte %d with %s; discarded the partial", op, offset, resp.Status)
-	default:
-		return retryableHTTPStatus(resp.StatusCode), fmt.Errorf("%s: unexpected status %s", op, resp.Status)
+	offset, retry, err = classifyRangeResponse(resp, offset, destPath)
+	if err != nil {
+		return retry, fmt.Errorf("%s: %w", op, err)
 	}
 
 	remaining := art.Size - offset
@@ -204,6 +190,34 @@ func downloadAttempt(ctx context.Context, art PlatformArtifact, destPath string)
 		return false, fmt.Errorf("%s: sha256 %s does not match manifest %s", op, sum, art.SHA256)
 	}
 	return false, nil
+}
+
+// classifyRangeResponse interprets the status of a ranged download response
+func classifyRangeResponse(resp *http.Response, offset int64, destPath string) (newOffset int64, retry bool, err error) {
+	switch resp.StatusCode {
+	case http.StatusOK:
+		return 0, false, nil
+	case http.StatusPartialContent:
+		if start, ok := contentRangeStart(resp.Header.Get("Content-Range")); !ok || start != offset {
+			return 0, false, nil
+		}
+		return offset, false, nil
+	case http.StatusRequestedRangeNotSatisfiable:
+		// This server will not serve our prefix; it is dead weight now.
+		_ = os.Remove(destPath)
+		if offset == 0 {
+			// We did not ask for a range, so repeating the request would get
+			// the same answer.
+			return 0, false, fmt.Errorf("server rejected an unranged request with %s", resp.Status)
+		}
+		return 0, true, fmt.Errorf("server rejected resume at byte %d with %s; discarded the partial", offset, resp.Status)
+	default:
+		// 408 and 429 are the two 4xx that mean "later, not never"; everything
+		// else in the 4xx range says the request itself is wrong, and repeating
+		// it just adds load. 5xx is always worth another attempt.
+		retryable := resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		return 0, retryable, fmt.Errorf("unexpected status %s", resp.Status)
+	}
 }
 
 // resumeOffset reports how many bytes of destPath may be reused as a prefix of
@@ -304,18 +318,7 @@ func writeArtifactBody(destPath string, offset int64, body io.Reader, h hash.Has
 	return written, nil, nil
 }
 
-// backoffDelay returns how long to wait before retry number attempt (1 is the
-// first retry). The exponential term doubles per attempt from base and is capped
-// at maxBackoffDelay; the returned delay is that term with "equal jitter"
-// applied, so it always lands in [term/2, term] and is never negative.
-//
-// The jitter is not cosmetic. A CDN blip fails every client in the fleet at the
-// same instant; without jitter they all retry in lockstep and the synchronised
-// herd keeps the origin down. Half the delay is kept fixed so the schedule
-// still demonstrably grows with each attempt.
-//
-// A nil rnd means no jitter (the deterministic lower bound), which keeps the
-// function usable from tests and from any caller that has no source to hand.
+// backoffDelay returns how long to wait before retry
 func backoffDelay(attempt int, base time.Duration, rnd *rand.Rand) time.Duration {
 	if attempt < 1 {
 		return 0
@@ -342,17 +345,6 @@ func backoffDelay(attempt int, base time.Duration, rnd *rand.Rand) time.Duration
 		return half
 	}
 	return half + time.Duration(rnd.Int63n(int64(half)+1))
-}
-
-// retryableHTTPStatus reports whether a status is worth another attempt. 408 and
-// 429 are the two 4xx that mean "later, not never"; everything else in the 4xx
-// range says the request itself is wrong, and repeating it just adds load.
-func retryableHTTPStatus(code int) bool {
-	switch code {
-	case http.StatusRequestTimeout, http.StatusTooManyRequests:
-		return true
-	}
-	return code >= 500
 }
 
 // contentRangeStart parses the first byte position out of a Content-Range header

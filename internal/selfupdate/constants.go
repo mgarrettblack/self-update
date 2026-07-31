@@ -65,5 +65,3 @@ const (
 	DownloadSuffix = ".download"
 	StagedSuffix   = ".new"
 )
-
-const decompressionRatioEstimate = 4

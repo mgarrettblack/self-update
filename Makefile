@@ -10,3 +10,5 @@ validate:
 	else \
 		echo "gofmt: no issues found"; \
 	fi
+	@echo "Running go vet..."
+	@go vet ./... && echo "all good"

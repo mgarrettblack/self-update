@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
-	"syscall"
 
 	"golang.org/x/sys/windows"
 )
@@ -105,18 +103,18 @@ const brokenSuffix = ".broken"
 // worse than a failed update that changes nothing.
 //
 // app.exe.old is deliberately not deleted here: the outgoing process is still
-// executing it. RemoveOld on the next successful launch does that cleanup.
+// executing it. UpdateSuccessful on the next successful launch does that cleanup.
 func applySwap(newBinary, target string) error {
 	old := OldPath(target)
 
 	if err := os.Remove(old); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return swapError("apply: remove stale old", err)
+		return fmt.Errorf("apply: remove stale old: %w", err)
 	}
 
 	targetExists := true
 	if _, err := os.Lstat(target); err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			return swapError("apply: stat target", err)
+			return fmt.Errorf("apply: stat target: %w", err)
 		}
 		// First install: there is nothing to move aside or retain.
 		targetExists = false
@@ -124,7 +122,7 @@ func applySwap(newBinary, target string) error {
 
 	if targetExists {
 		if err := os.Rename(target, old); err != nil {
-			return swapError("apply: rename target aside", err)
+			return fmt.Errorf("apply: rename target aside: %w", err)
 		}
 	}
 
@@ -139,7 +137,7 @@ func applySwap(newBinary, target string) error {
 					err, target, restoreErr)
 			}
 		}
-		return swapError("apply: rename staged binary", err)
+		return fmt.Errorf("apply: rename staged binary: %w", err)
 	}
 	return nil
 }
@@ -167,11 +165,11 @@ func restoreOld(old, target string) error {
 			return fmt.Errorf("restore old: cannot move %q aside: a previous .broken file is still in place", target)
 		}
 		if err := os.Rename(target, broken); err != nil {
-			return swapError("restore old: rename current aside", err)
+			return fmt.Errorf("restore old: rename current aside: %w", err)
 		}
 		movedAside = true
 	} else if !errors.Is(err, fs.ErrNotExist) {
-		return swapError("restore old: stat target", err)
+		return fmt.Errorf("restore old: stat target: %w", err)
 	}
 
 	if err := os.Rename(old, target); err != nil {
@@ -181,7 +179,7 @@ func restoreOld(old, target string) error {
 					err, target, restoreErr)
 			}
 		}
-		return swapError("restore old: rename retained generation", err)
+		return fmt.Errorf("restore old: rename retained generation: %w", err)
 	}
 
 	if movedAside {
@@ -190,55 +188,4 @@ func restoreOld(old, target string) error {
 		_ = os.Remove(broken)
 	}
 	return nil
-}
-
-// RelaunchReplacesProcess reports whether Relaunch replaces the current
-// process image (unix) or spawns a new process the caller must exit after
-// (windows). Callers need to know whether Relaunch returns on success.
-//
-// On Windows it is false: there is no execve equivalent, so Relaunch starts a
-// child and returns. The caller MUST then shut down and exit — the old process
-// keeps app.exe.old open, and the new one only gets a clean directory once the
-// old one is gone.
-const RelaunchReplacesProcess = false
-
-// createNewProcessGroup is CREATE_NEW_PROCESS_GROUP. The successor is put in its
-// own group so that a console Ctrl+C or Ctrl+Break aimed at the outgoing
-// process (or the shell that launched it) does not also kill the process we
-// just started.
-//
-// DETACHED_PROCESS is deliberately *not* used: it would strip the successor of
-// the console it inherited, which for a CLI means the user stops seeing output
-// across an update. A new process group is enough to decouple lifetimes.
-const createNewProcessGroup = 0x00000200
-
-func init() { execProcess = execSpawn }
-
-// execSpawn starts path as an independent child process and returns.
-//
-// Standard streams are inherited so the successor keeps whatever console or
-// redirection the current process had. The child handle is released rather than
-// waited on: the caller is about to exit, and the successor must not become a
-// zombie of, or be tied to, a parent that is going away.
-func execSpawn(path string, argv, env []string) error {
-	// Built literally rather than via exec.Command: path is already absolute
-	// and argv already carries the argv[0] the caller wants, so there is no PATH
-	// lookup to do and no argv[0] for exec.Command to pick on our behalf.
-	cmd := &exec.Cmd{
-		Path:        path,
-		Args:        argv,
-		Env:         env,
-		Stdin:       os.Stdin,
-		Stdout:      os.Stdout,
-		Stderr:      os.Stderr,
-		SysProcAttr: &syscall.SysProcAttr{CreationFlags: createNewProcessGroup},
-	}
-
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	if cmd.Process == nil {
-		return nil
-	}
-	return cmd.Process.Release()
 }

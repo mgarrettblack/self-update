@@ -5,17 +5,122 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
-// Config is plain data: the three things the library cannot infer for itself.
-// Every other tunable lives in constants.go, and there are no methods — the
-// lifecycle is a set of package-level functions and the caller sequences them.
+// ErrLocked is returned when another instance already holds the update lock.
+var ErrLocked = errors.New("another instance holds the update lock")
+
+type Lock struct {
+	path string
+
+	mu   sync.Mutex
+	file *os.File // nil once released
+}
+
+func AcquireLock(path string) (*Lock, error) {
+	const op = "acquire lock"
+
+	if path == "" {
+		return nil, fmt.Errorf("%s: empty lock path", op)
+	}
+
+	// The state directory may not exist yet on a first run.
+	if err := os.MkdirAll(filepath.Dir(path), lockDirMode); err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	// O_CREATE|O_RDWR, not O_TRUNC: truncating would mutate a file another
+	// instance currently holds locked, and there is nothing in it to clear.
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, lockFileMode)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	if err := lockFile(f); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("%s: %w", op, err)
+	}
+
+	return &Lock{path: path, file: f}, nil
+}
+
+func (l *Lock) Release() error {
+	if l == nil {
+		return nil
+	}
+
+	l.mu.Lock()
+	f := l.file
+	l.file = nil
+	l.mu.Unlock()
+
+	if f == nil {
+		return nil
+	}
+
+	unlockErr := unlockFile(f)
+	closeErr := f.Close()
+
+	err := errors.Join(unlockErr, closeErr)
+	if err != nil {
+		return fmt.Errorf("release lock: %w", err)
+	}
+	return nil
+}
+
+func DecompressFile(src, dst string) error {
+	const op = "decompress artifact"
+
+	in, err := os.Open(src)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	defer in.Close()
+
+	dec, err := zstd.NewReader(in)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	defer dec.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return fmt.Errorf("%s: %w", op, err)
+	}
+	defer out.Close()
+
+	defer func() {
+		if err != nil {
+			os.Remove(dst)
+		}
+	}()
+
+	written, copyErr := io.Copy(out, io.LimitReader(dec.IOReadCloser(), maxDecompressedBytes+1))
+	closeErr := out.Close()
+
+	switch {
+	case copyErr != nil:
+		err = fmt.Errorf("%s: %w", op, copyErr)
+	case written > maxDecompressedBytes:
+		err = fmt.Errorf("%s: artifact expands past the %d byte limit", op, maxDecompressedBytes)
+	case closeErr != nil:
+		err = fmt.Errorf("%s: %w", op, closeErr)
+	case written == 0:
+		err = fmt.Errorf("%s: artifact is empty", op)
+	}
+	return err
+}
+
 type Config struct {
 	ManifestURL string
 	TargetPath  string
@@ -60,16 +165,6 @@ func NewConfig(manifestURL, targetPath, stateDir string) (Config, error) {
 	}, nil
 }
 
-// Decision is the outcome of a check. Manifest is populated whenever a manifest
-// was fetched and verified, even when no update applies, so the caller can log
-// what the published version is.
-type Decision struct {
-	Manifest        *Manifest
-	Artifact        PlatformArtifact
-	UpdateAvailable bool
-	CurrentVersion  string
-}
-
 var checkClient = &http.Client{Timeout: defaultCheckTimeout}
 
 func CheckForUpdate(ctx context.Context, cfg Config) (bool, *Manifest, error) {
@@ -91,8 +186,7 @@ func CheckForUpdate(ctx context.Context, cfg Config) (bool, *Manifest, error) {
 	return available, manifest, err
 }
 
-// FetchArtifact gets the platform-specific artifact from the manifest, preflights
-// disk space, downloads it, and verifies its SHA-256.
+// FetchArtifact gets the platform-specific artifact from the manifest
 func FetchArtifact(ctx context.Context, manifest *Manifest, cfg Config) error {
 	const op = "fetch artifact"
 
@@ -131,7 +225,7 @@ func apply(newBinary, target string) error {
 
 	sameDir, err := sameDirectory(newBinary, target)
 	if err != nil {
-		return swapError("apply: resolve paths", err)
+		return fmt.Errorf("apply: resolve paths: %w", err)
 	}
 	if !sameDir {
 		return fmt.Errorf("apply: staged binary %q is not in the target's directory %q: a cross-volume rename is not atomic",
@@ -139,7 +233,7 @@ func apply(newBinary, target string) error {
 	}
 
 	if _, err := os.Stat(newBinary); err != nil {
-		return swapError("apply: stat staged binary", err)
+		return fmt.Errorf("apply: stat staged binary: %w", err)
 	}
 
 	return applySwap(newBinary, target)
@@ -152,9 +246,6 @@ func ApplyUpdate(ctx context.Context, cfg Config, manifest *Manifest) error {
 	compressed := target + DownloadSuffix
 	staged := target + StagedSuffix
 
-	// The lock covers download through swap. Two instances staging to the same
-	// paths would interleave writes into one file and produce a binary that
-	// matches no digest at all.
 	if err := os.MkdirAll(cfg.StateDir, stateDirMode); err != nil {
 		return fmt.Errorf("create state directory: %w", err)
 	}
@@ -196,10 +287,7 @@ type Marker struct {
 	Attempts    int       `json:"attempts"`
 }
 
-// markPending records that an update was applied but has not yet reported
-// healthy. It is unexported because ApplyUpdate is its only legitimate caller:
-// a marker written by anyone else claims an update that never happened, and
-// the next start would revert on the strength of it.
+// markPending records that an update was applied but has not yet reported healthy
 func markPending(cfg Config, fromVersion, toVersion string) error {
 	if cfg.StateDir == "" {
 		return fmt.Errorf("mark pending: no state dir configured")
@@ -217,10 +305,7 @@ func markPending(cfg Config, fromVersion, toVersion string) error {
 	return writeMarker(cfg, m)
 }
 
-// UpdateSuccessful clears the pending-update marker and removes the old
-// binary left over from the swap. It returns false if the marker cannot be
-// removed (including when no marker exists) or if the old binary cannot be
-// removed.
+// UpdateSuccessful checks that previous install was successful
 func UpdateSuccessful(cfg Config) bool {
 	if cfg.StateDir == "" {
 		return false
