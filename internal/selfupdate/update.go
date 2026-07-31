@@ -230,7 +230,7 @@ func MarkHealthy(cfg Config) error {
 	if cfg.StateDir == "" {
 		return fmt.Errorf("mark healthy: no state dir configured")
 	}
-	if err := removeFile(filepath.Join(cfg.StateDir, markerFilename)); err != nil {
+	if err := os.Remove(filepath.Join(cfg.StateDir, markerFilename)); err != nil {
 		return fmt.Errorf("mark healthy: %w", err)
 	}
 	return nil
@@ -254,10 +254,11 @@ func UpdateSuccessful(cfg Config) bool {
 // gone, so the next start will not retry.
 func Rollback(cfg Config) {
 	// Step 1: rename <TargetPath>.old back onto TargetPath.
-	RestoreOld(cfg.TargetPath)
+	os.Rename(cfg.TargetPath+oldSuffix, cfg.TargetPath)
+	os.Chmod(cfg.TargetPath, binaryMode)
 
 	// Step 2: remove the marker
-	removeFile(filepath.Join(cfg.StateDir, markerFilename))
+	os.Remove(filepath.Join(cfg.StateDir, markerFilename))
 
 }
 
@@ -276,15 +277,6 @@ func writeMarker(cfg Config, m Marker) error {
 	if err := os.Rename(tmp, filepath.Join(cfg.StateDir, markerFilename)); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("write marker: rename: %w", err)
-	}
-	return nil
-}
-
-// removeFile deletes path, treating an already-absent file as success: every
-// caller wants the file gone, and it already is.
-func removeFile(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return err
 	}
 	return nil
 }

@@ -177,10 +177,6 @@ func sameDirectory(a, b string) (bool, error) {
 	return realA == realB, nil
 }
 
-func swapError(op string, err error) error {
-	return fmt.Errorf("%s: %w", op, err)
-}
-
 var execProcess func(path string, argv, env []string) error
 
 func Relaunch(path string, argv []string) error {
