@@ -1,0 +1,11 @@
+{
+  "version": "9.9.9",
+  "rollout": 100,
+  "platforms": {
+    "darwin-arm64": {
+      "url": "http://127.0.0.1:8099/a.zst",
+      "sha256": "<sha256 of the compressed artifact, lowercase hex>",
+      "size": 123456
+    }
+  }
+}

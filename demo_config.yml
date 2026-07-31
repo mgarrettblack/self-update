@@ -1,0 +1,31 @@
+# Example config for cmd/app, loaded with `-demo <path>` (default: this file,
+# resolved relative to the working directory the demo is run from).
+#
+# See the "Driving it end to end" recipe in CLAUDE.md for how to stand up a
+# local release host these values can point at.
+
+# Full URL of the signed release manifest. Required.
+manifest_url: http://127.0.0.1:8099/manifest.json
+
+# Endpoint for update telemetry. Leave empty to disable reporting entirely.
+telemetry_url: ""
+
+# Executable to replace. Leave empty to replace the running executable.
+target: /tmp/install/demoapp
+
+# Directory for the lock, install id and rollback marker. Leave empty for
+# the platform default state directory.
+state_dir: /tmp/st
+
+# Base interval between update checks, before jitter.
+interval: 1h
+
+# Ask on stdin before applying an update.
+confirm: false
+
+# Check once, then exit, instead of polling for the life of the process.
+once: false
+
+# Allow plaintext HTTP for the manifest and artifact. Only for a local
+# release host during development — never set this against a real one.
+insecure: true
