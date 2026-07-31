@@ -422,6 +422,8 @@ func (p *Poller) Update(ctx context.Context) (UpdateResult, error) {
 		return res, err
 	}
 
+	// Step 1: check for update — fetch, verify and parse the manifest, then
+	// decide whether a newer release applies to this install.
 	d, err := p.Checker.Check(ctx)
 	if err != nil {
 		logFailure(p.logger(), p.Checker.CurrentVersion, "", err)
@@ -429,6 +431,7 @@ func (p *Poller) Update(ctx context.Context) (UpdateResult, error) {
 	}
 	res.Decision = d
 
+	// Step 2: no update available — nothing further to do this cycle.
 	if !d.UpdateAvailable {
 		p.logf("no update: %s", d.Reason)
 		if p.ReportNoUpdate {
@@ -437,6 +440,8 @@ func (p *Poller) Update(ctx context.Context) (UpdateResult, error) {
 		return res, nil
 	}
 
+	// Step 3: confirmation gate — optional, consulted before anything is
+	// downloaded.
 	if p.RequireConfirmation != nil && !p.RequireConfirmation(d) {
 		// Asked before downloading, not after: consent that arrives once the
 		// bytes are already on disk is not much of a choice.
@@ -444,6 +449,7 @@ func (p *Poller) Update(ctx context.Context) (UpdateResult, error) {
 		return res, nil
 	}
 
+	// Step 4: apply the update — download, decompress, swap and mark pending.
 	if err := p.apply(ctx, target, d); err != nil {
 		logFailure(p.logger(), d.CurrentVersion, d.Manifest.Version, err)
 		return res, err
@@ -453,6 +459,7 @@ func (p *Poller) Update(ctx context.Context) (UpdateResult, error) {
 	level.Info(p.logger()).Log("msg", "update applied", "from", d.CurrentVersion, "to", d.Manifest.Version)
 	p.logf("updated %s to %s", d.CurrentVersion, d.Manifest.Version)
 
+	// Step 5: relaunch into the new binary.
 	if err := p.relaunch(target); err != nil {
 		// The swap succeeded, so the update is real and the marker is in place;
 		// we simply could not hand over. Staying alive on the old image is
@@ -481,6 +488,7 @@ func (p *Poller) apply(ctx context.Context, target string, d *Decision) error {
 	if lockPath == "" {
 		lockPath = filepath.Join(p.StateDir, lockFilename)
 	}
+	// Step 4a: acquire the update lock — covers download through swap.
 	lock, err := AcquireLock(lockPath)
 	if err != nil {
 		return err
@@ -497,9 +505,9 @@ func (p *Poller) apply(ctx context.Context, target string, d *Decision) error {
 		lock.Release()
 	}()
 
-	// ensureFreeSpace preflights the disk space needed for the artifact and its
-	// decompressed expansion, on the volume that will hold both. Checked before
-	// the first byte is requested.
+	// Step 4b: preflight disk space — ensureFreeSpace checks the artifact and
+	// its decompressed expansion, on the volume that will hold both. Checked
+	// before the first byte is requested.
 	need := d.Artifact.Size * (1 + decompressionRatioEstimate)
 	if need < d.Artifact.Size { // overflow on an absurd declared size
 		return classifyf(ClassManifestInvalid, "update",
@@ -515,19 +523,21 @@ func (p *Poller) apply(ctx context.Context, target string, d *Decision) error {
 	if downloader == nil {
 		downloader = &Downloader{}
 	}
-	// Fetch verifies SHA-256 over the compressed bytes — the ones the signed
-	// manifest covers — and returns nil only if they match.
+	// Step 4c: download — Fetch verifies SHA-256 over the compressed bytes,
+	// the ones the signed manifest covers, and returns nil only if they match.
 	if err := downloader.Fetch(ctx, d.Artifact, compressed); err != nil {
 		return err
 	}
-	// Only now, on bytes that are already verified.
+	// Step 4d: decompress — only now, on bytes that are already verified.
 	if err := DecompressFile(compressed, staged); err != nil {
 		return err
 	}
+	// Step 4e: apply — swap the staged binary onto the target.
 	if err := Apply(staged, target); err != nil {
 		return err
 	}
 
+	// Step 4f: mark pending — recorded after the swap, before relaunch.
 	return p.guard(target).MarkPending(d.CurrentVersion, d.Manifest.Version)
 }
 
