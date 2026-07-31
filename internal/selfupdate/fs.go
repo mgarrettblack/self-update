@@ -131,13 +131,6 @@ func Apply(newBinary, target string) error {
 	return applySwap(newBinary, target)
 }
 
-func RemoveOld(target string) error {
-	if err := os.Remove(OldPath(target)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return swapError("remove old", err)
-	}
-	return nil
-}
-
 func RestoreOld(target string) error {
 	if target == "" {
 		return fmt.Errorf("restore old: empty target path")

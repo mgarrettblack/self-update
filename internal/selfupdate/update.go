@@ -196,12 +196,6 @@ type Marker struct {
 	Attempts    int       `json:"attempts"`
 }
 
-// StartupResult is what CheckStartup observed.
-type StartupResult struct {
-	Reverted bool
-	Marker   *Marker // the marker that was found, if any
-}
-
 // markPending records that an update was applied but has not yet reported
 // healthy. It is unexported because ApplyUpdate is its only legitimate caller:
 // a marker written by anyone else claims an update that never happened, and
@@ -223,41 +217,31 @@ func markPending(cfg Config, fromVersion, toVersion string) error {
 	return writeMarker(cfg, m)
 }
 
-// MarkHealthy clears the marker once startup has completed successfully. It is
-// a no-op when there is no marker, so it is safe to call unconditionally at the
-// end of startup on every run, not just post-update ones.
-func MarkHealthy(cfg Config) error {
-	if cfg.StateDir == "" {
-		return fmt.Errorf("mark healthy: no state dir configured")
-	}
-	if err := os.Remove(filepath.Join(cfg.StateDir, markerFilename)); err != nil {
-		return fmt.Errorf("mark healthy: %w", err)
-	}
-	return nil
-}
-
+// UpdateSuccessful clears the pending-update marker and removes the old
+// binary left over from the swap. It returns false if the marker cannot be
+// removed (including when no marker exists) or if the old binary cannot be
+// removed.
 func UpdateSuccessful(cfg Config) bool {
-	if err := MarkHealthy(cfg); err != nil {
+	if cfg.StateDir == "" {
 		return false
 	}
-	if err := RemoveOld(cfg.TargetPath); err != nil {
+	// Step 1: remove marker file
+	if err := os.Remove(filepath.Join(cfg.StateDir, markerFilename)); err != nil {
+		return false
+	}
+	// Step 2: remove old binary
+	if err := os.Remove(OldPath(cfg.TargetPath)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return false
 	}
 	return true
 }
 
-// Rollback puts the previous generation back and clears the marker.
-//
-// Both errors are returned because no caller can otherwise observe them, and a
-// silently failed restore is the most damaging state in the system: the process
-// keeps running a binary that never reported healthy, with the marker already
-// gone, so the next start will not retry.
 func Rollback(cfg Config) {
 	// Step 1: rename <TargetPath>.old back onto TargetPath.
 	os.Rename(cfg.TargetPath+oldSuffix, cfg.TargetPath)
 	os.Chmod(cfg.TargetPath, binaryMode)
 
-	// Step 2: remove the marker
+	// Step 2: remove the marker file
 	os.Remove(filepath.Join(cfg.StateDir, markerFilename))
 
 }
