@@ -2,9 +2,7 @@ package selfupdate
 
 import (
 	"cmp"
-	"crypto/ed25519"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -202,9 +200,6 @@ func (m *Manifest) Artifact(platform string) (PlatformArtifact, error) {
 func PlatformKey() string { return runtime.GOOS + "-" + runtime.GOARCH }
 
 // ParseManifest decodes, normalizes and validates a manifest document.
-//
-// Callers must only ever run this on bytes whose signature already verified —
-// parsing an unverified manifest means acting on attacker-controlled URLs.
 func ParseManifest(b []byte) (*Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(b, &m); err != nil {
@@ -221,10 +216,6 @@ func ParseManifest(b []byte) (*Manifest, error) {
 }
 
 // Validate checks the manifest is internally coherent.
-//
-// The release service is expected to have validated the release before signing
-// it, but the client validates again anyway: a signature proves the manifest
-// came from the release pipeline, not that the pipeline got it right.
 func (m *Manifest) Validate() error {
 	const op = "validate manifest"
 
@@ -268,179 +259,11 @@ func (a PlatformArtifact) validate() error {
 		return fmt.Errorf("url %q is not absolute", a.URL)
 	}
 	// http is accepted here only so a release host can be exercised locally;
-	// the Checker rejects it unless insecure URLs are explicitly opted into.
+	// requireHTTPS rejects it unless SELFUPDATE_ALLOW_HTTP is set.
 	if u.Scheme != "https" && u.Scheme != "http" {
 		return fmt.Errorf("url %q has unsupported scheme %q", a.URL, u.Scheme)
 	}
 	return nil
-}
-
-// Verifier checks detached Ed25519 signatures against a set of trusted public
-// keys.
-//
-// It is a *set*, not a single key, deliberately: rotating away from a
-// compromised key requires that already-deployed clients accept a signature
-// from the replacement. A client that trusts exactly one key can never be
-// migrated off it. See bakedInTrustedKeys below for the rotation procedure.
-type Verifier struct {
-	keys []ed25519.PublicKey
-}
-
-// NewVerifier builds a verifier over the given trust set. An empty set is
-// rejected: a verifier that can never accept anything would silently disable
-// updates forever rather than fail visibly.
-func NewVerifier(keys ...ed25519.PublicKey) (*Verifier, error) {
-	if len(keys) == 0 {
-		return nil, classify(ClassInternal, "new verifier", errors.New("trust set is empty"))
-	}
-	trusted := make([]ed25519.PublicKey, 0, len(keys))
-	for i, k := range keys {
-		if len(k) != ed25519.PublicKeySize {
-			return nil, classifyf(ClassInternal, "new verifier",
-				"key %d is %d bytes, want %d", i, len(k), ed25519.PublicKeySize)
-		}
-		trusted = append(trusted, k)
-	}
-	return &Verifier{keys: trusted}, nil
-}
-
-// Verify reports whether sig is a valid signature over message by any trusted
-// key. Every failure is a ClassSignatureInvalid error — there is no partial
-// success and no fallback path that accepts unverified bytes.
-func (v *Verifier) Verify(message, sig []byte) error {
-	if len(sig) != ed25519.SignatureSize {
-		return classifyf(ClassSignatureInvalid, "verify signature",
-			"signature is %d bytes, want %d", len(sig), ed25519.SignatureSize)
-	}
-	for _, k := range v.keys {
-		if ed25519.Verify(k, message, sig) {
-			return nil
-		}
-	}
-	return classifyf(ClassSignatureInvalid, "verify signature",
-		"no trusted key matched (%d in trust set)", len(v.keys))
-}
-
-// ParsePublicKey decodes a standard-base64 Ed25519 public key.
-func ParsePublicKey(s string) (ed25519.PublicKey, error) {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return nil, classify(ClassInternal, "parse public key", errors.New("empty"))
-	}
-	raw, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return nil, classify(ClassInternal, "parse public key", err)
-	}
-	if len(raw) != ed25519.PublicKeySize {
-		return nil, classifyf(ClassInternal, "parse public key",
-			"decoded to %d bytes, want %d", len(raw), ed25519.PublicKeySize)
-	}
-	return ed25519.PublicKey(raw), nil
-}
-
-// ParsePublicKeys decodes a comma-separated list of base64 public keys,
-// skipping blank entries so a trailing comma in a build flag is harmless.
-func ParsePublicKeys(list string) ([]ed25519.PublicKey, error) {
-	var keys []ed25519.PublicKey
-	for _, field := range strings.Split(list, ",") {
-		if strings.TrimSpace(field) == "" {
-			continue
-		}
-		k, err := ParsePublicKey(field)
-		if err != nil {
-			return nil, err
-		}
-		keys = append(keys, k)
-	}
-	return keys, nil
-}
-
-// DecodeSignature decodes the contents of a detached `.sig` file: one
-// base64-encoded Ed25519 signature, with surrounding whitespace tolerated
-// because most tooling appends a trailing newline.
-func DecodeSignature(fileContents []byte) ([]byte, error) {
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(fileContents)))
-	if err != nil {
-		return nil, classify(ClassSignatureInvalid, "decode signature", err)
-	}
-	if len(raw) != ed25519.SignatureSize {
-		return nil, classifyf(ClassSignatureInvalid, "decode signature",
-			"decoded to %d bytes, want %d", len(raw), ed25519.SignatureSize)
-	}
-	return raw, nil
-}
-
-// TrustedKeysBase64 is the release trust set, injected at link time:
-//
-//	go build -ldflags "-X self-update/internal/selfupdate.TrustedKeysBase64=$PUBKEY"
-//
-// Multiple keys are comma separated. This is deliberately a build-time input
-// and never a runtime one: a public key read from a config file, an environment
-// variable or the network is a public key an attacker can replace, which
-// reduces signature verification to theatre.
-var TrustedKeysBase64 = ""
-
-// bakedInTrustedKeys is the trust set committed to source. Keeping keys here as
-// well as in TrustedKeysBase64 is what makes rotation survivable — see the
-// procedure below.
-//
-// Rotating a signing key. The release service owns the keys; the client's part
-// is to trust the incoming one before the service starts using it:
-//
-//  1. Get the new public key from whoever runs the release service, add it to
-//     this slice keeping the outgoing key in place, and ship that build.
-//  2. Wait until effectively every client is running a build that trusts both
-//     keys. Until that point, releases must still be signed by the old key.
-//  3. Only then does the release service switch to signing with the new key.
-//  4. Once no supported client trusts the old key alone, remove it here.
-//
-// Skipping step 2 strands every client that has not yet updated: it will reject
-// all future releases as unsigned and can never update itself out of that state
-// without manual reinstallation.
-var bakedInTrustedKeys = []string{
-	// No keys are committed to this repository. Supply the trust set with
-	// -ldflags, or add the project's release public keys here.
-}
-
-// TrustedVerifier returns a Verifier over the compile-time trust set.
-//
-// It fails when the trust set is empty rather than returning a permissive
-// verifier. A build that shipped with no keys would otherwise have to choose at
-// runtime between "reject everything" and "accept anything", and the second is
-// a remote code execution vector; refusing at construction makes the mistake
-// visible on the first check instead.
-func TrustedVerifier() (*Verifier, error) {
-	const op = "load trusted keys"
-
-	// TrustedKeysBase64 is a comma-separated list; split it into fields only
-	// when it holds something, so an unset build flag contributes no entries
-	// rather than one spurious empty string.
-	var configured []string
-	if strings.TrimSpace(TrustedKeysBase64) != "" {
-		configured = strings.Split(TrustedKeysBase64, ",")
-	}
-
-	var encoded []string
-	seen := make(map[string]bool)
-	for _, k := range append(append([]string{}, bakedInTrustedKeys...), configured...) {
-		k = strings.TrimSpace(k)
-		if k == "" || seen[k] {
-			continue
-		}
-		seen[k] = true
-		encoded = append(encoded, k)
-	}
-	if len(encoded) == 0 {
-		return nil, classify(ClassInternal, op, errors.New(
-			"no trusted public keys are compiled in; build with "+
-				`-ldflags "-X self-update/internal/selfupdate.TrustedKeysBase64=<base64 key>"`))
-	}
-
-	keys, err := ParsePublicKeys(strings.Join(encoded, ","))
-	if err != nil {
-		return nil, err
-	}
-	return NewVerifier(keys...)
 }
 
 // InRolloutCohort reports whether this install is in the cohort for a release

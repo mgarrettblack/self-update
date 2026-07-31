@@ -19,15 +19,12 @@ import (
 
 // fetchBytes issues a GET against rawURL and returns its body, capped at max
 // bytes. It is used for both the manifest and its detached signature.
-func fetchBytes(ctx context.Context, client *http.Client, rawURL, userAgent string, max int64) ([]byte, error) {
+func fetchBytes(ctx context.Context, client *http.Client, rawURL string, max int64) ([]byte, error) {
 	op := "fetch " + urlPath(rawURL)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, classify(ClassInternal, op, err)
-	}
-	if userAgent != "" {
-		req.Header.Set("User-Agent", userAgent)
 	}
 	// Release buckets sit behind CDNs that will happily serve a cached manifest
 	// long after a release has been pulled.
@@ -58,8 +55,9 @@ func fetchBytes(ctx context.Context, client *http.Client, rawURL, userAgent stri
 	return data, nil
 }
 
-// requireHTTPS enforces transport security on a URL unless explicitly waived.
-func requireHTTPS(rawURL string, allowInsecure bool, what string, class ErrorClass) error {
+// requireHTTPS enforces transport security on a URL. The only waiver is
+// SELFUPDATE_ALLOW_HTTP; see allowHTTP for why that is development-only.
+func requireHTTPS(rawURL string, what string, class ErrorClass) error {
 	op := "validate " + what + " URL"
 
 	u, err := url.Parse(rawURL)
@@ -69,7 +67,7 @@ func requireHTTPS(rawURL string, allowInsecure bool, what string, class ErrorCla
 	if u.Scheme == "https" {
 		return nil
 	}
-	if allowInsecure {
+	if allowHTTP() {
 		return nil
 	}
 	return classifyf(class, op, "%s URL uses scheme %q; HTTPS is required", what, u.Scheme)
@@ -89,15 +87,11 @@ func urlPath(rawURL string) string {
 // reuse survive across polls.
 var defaultDownloadClient = &http.Client{Timeout: defaultFetchTimeout}
 
-type Downloader struct {
-	Client      *http.Client                  // nil means a sane default client with a timeout
-	MaxAttempts int                           // 0 means default 4
-	BaseBackoff time.Duration                 // 0 means default 1s
-	Progress    func(downloaded, total int64) // optional, may be nil
-	UserAgent   string                        // optional
-}
-
-func (d *Downloader) Fetch(ctx context.Context, art PlatformArtifact, destPath string) error {
+// downloadArtifact fetches art into destPath and verifies SHA-256 over the
+// bytes written, retrying a resumable failure up to defaultFetchAttempts times.
+// It returns nil only when the file on disk matches the digest the manifest
+// advertises, which is the precondition DecompressFile and Apply rely on.
+func downloadArtifact(ctx context.Context, art PlatformArtifact, destPath string) error {
 	const op = "download artifact"
 
 	art.SHA256 = strings.ToLower(strings.TrimSpace(art.SHA256))
@@ -106,16 +100,8 @@ func (d *Downloader) Fetch(ctx context.Context, art PlatformArtifact, destPath s
 		return classify(ClassManifestInvalid, op, err)
 	}
 
-	attempts := d.MaxAttempts
-	if attempts <= 0 {
-		attempts = defaultFetchAttempts
-	}
-	base := d.BaseBackoff
-	if base <= 0 {
-		base = defaultBaseBackoff
-	}
-
-	prog := &progressGate{fn: d.Progress, total: art.Size, high: -1}
+	attempts := defaultFetchAttempts
+	base := defaultBaseBackoff
 
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
@@ -137,7 +123,7 @@ func (d *Downloader) Fetch(ctx context.Context, art PlatformArtifact, destPath s
 			}
 		}
 
-		retry, err := d.attempt(ctx, art, destPath, prog)
+		retry, err := downloadAttempt(ctx, art, destPath)
 		if err == nil {
 			return nil
 		}
@@ -149,7 +135,10 @@ func (d *Downloader) Fetch(ctx context.Context, art PlatformArtifact, destPath s
 	return classifyf(ClassNetwork, op, "gave up after %d attempts: %w", attempts, lastErr)
 }
 
-func (d *Downloader) attempt(ctx context.Context, art PlatformArtifact, destPath string, prog *progressGate) (retry bool, err error) {
+// downloadAttempt is one pass of downloadArtifact's retry loop. retry reports
+// whether the failure is worth another attempt; a nil error means destPath holds
+// the full artifact and its digest matched.
+func downloadAttempt(ctx context.Context, art PlatformArtifact, destPath string) (retry bool, err error) {
 	const op = "download artifact"
 
 	offset := resumeOffset(destPath, art.Size)
@@ -158,20 +147,13 @@ func (d *Downloader) attempt(ctx context.Context, art PlatformArtifact, destPath
 	if err != nil {
 		return false, classify(ClassInternal, op, err)
 	}
-	if d.UserAgent != "" {
-		req.Header.Set("User-Agent", d.UserAgent)
-	}
 
 	req.Header.Set("Accept-Encoding", "identity")
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
 	}
 
-	client := d.Client
-	if client == nil {
-		client = defaultDownloadClient
-	}
-	resp, err := client.Do(req)
+	resp, err := defaultDownloadClient.Do(req)
 	if err != nil {
 		if ctx.Err() != nil {
 			return false, classify(ClassNetwork, op, ctx.Err())
@@ -212,9 +194,8 @@ func (d *Downloader) attempt(ctx context.Context, art PlatformArtifact, destPath
 	if err != nil {
 		offset, remaining, h = 0, art.Size, sha256.New()
 	}
-	prog.report(offset)
 
-	written, readErr, writeErr := writeArtifactBody(destPath, offset, io.LimitReader(resp.Body, remaining), h, prog)
+	written, readErr, writeErr := writeArtifactBody(destPath, offset, io.LimitReader(resp.Body, remaining), h)
 	total := offset + written
 
 	switch {
@@ -290,7 +271,7 @@ func seedHashFromPrefix(path string, n int64) (hash.Hash, error) {
 // Read and write failures are returned separately because they classify
 // differently: a truncated body is a resumable network problem, a failed write
 // is a full disk or a permissions problem.
-func writeArtifactBody(destPath string, offset int64, body io.Reader, h hash.Hash, prog *progressGate) (written int64, readErr, writeErr error) {
+func writeArtifactBody(destPath string, offset int64, body io.Reader, h hash.Hash) (written int64, readErr, writeErr error) {
 	flags := os.O_CREATE | os.O_WRONLY
 	if offset > 0 {
 		flags |= os.O_APPEND
@@ -316,7 +297,6 @@ func writeArtifactBody(destPath string, offset int64, body io.Reader, h hash.Has
 			}
 			h.Write(buf[:nr]) // hash.Hash never errors
 			written += int64(nr)
-			prog.report(offset + written)
 		}
 		if rerr != nil {
 			if errors.Is(rerr, io.EOF) {
@@ -410,25 +390,4 @@ func contentRangeStart(v string) (int64, bool) {
 		return 0, false
 	}
 	return n, true
-}
-
-// progressGate forwards byte counts to the caller's callback, dropping any
-// report that would move the count backwards.
-//
-// A restart from zero — the server ignored Range, or a partial turned out to be
-// unusable — genuinely rewinds the byte count, but a progress bar that jumps
-// backwards reads as a bug. Callers therefore only ever see the high-water mark
-// advance.
-type progressGate struct {
-	fn    func(downloaded, total int64)
-	total int64
-	high  int64
-}
-
-func (p *progressGate) report(downloaded int64) {
-	if p == nil || p.fn == nil || downloaded <= p.high {
-		return
-	}
-	p.high = downloaded
-	p.fn(downloaded, p.total)
 }

@@ -53,11 +53,10 @@ const (
 	lockFilename   = "update.lock"
 )
 
-// Poll cadence.
-const (
-	defaultPollInterval = time.Hour
-	pollJitterFraction  = 0.5
-)
+// Crash-loop budget: how many starts a pending update gets to report healthy
+// before CheckStartup reverts it. One means the very next start decides — a
+// build that cannot get through startup once will not get through it twice.
+const maxStartAttempts = 1
 
 // Staging-file suffixes.
 const (

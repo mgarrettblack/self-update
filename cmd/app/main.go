@@ -1,26 +1,16 @@
 // Command app is a demonstration application that keeps itself up to date.
 //
-// It exists to show the intended shape of the integration, which is mostly
-// about ordering:
-//
-//  1. Run the crash-loop check before anything else can crash.
-//  2. Do the application's own startup.
-//  3. Only then report healthy, which discards the rollback path.
-//  4. Poll for updates in the background, for the life of the process.
-//
-// Build it with a version and a trust set:
-//
-//	go build -ldflags "\
-//	  -X self-update/internal/selfupdate.Version=1.4.2 \
-//	  -X self-update/internal/selfupdate.TrustedKeysBase64=$PUBKEY" ./cmd/app
+// It exists to document the one call ordering the library cannot enforce for
+// itself: startup check, then the real startup work, then MarkHealthy, and only
+// then the poll loop. The four steps in run are numbered for that reason —
+// moving MarkHealthy ahead of the work that can fail defeats rollback entirely.
 package main
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
@@ -33,29 +23,14 @@ import (
 	"self-update/internal/selfupdate"
 )
 
-const appName = "demoapp"
-
-// defaultEnvPath is the default value of the -env flag.
-const defaultEnvPath = ".env.local"
-
-// Exit codes returned by run.
-const (
-	exitOK           = 0
-	exitRuntimeError = 1
-	exitUsageError   = 2
-)
-
 func main() {
-	// A signal-cancelled context rather than a signal handler that exits: the
-	// poller may be mid-download, and it needs the chance to clean up its
-	// staging files.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(ctx, os.Stdout))
 }
 
-// config is loaded from the env file named by -env.
+// config mirrors the dotenv at defaultEnvPath.
 type config struct {
 	ManifestURL string        `mapstructure:"manifest_url"`
 	Target      string        `mapstructure:"target"`
@@ -63,150 +38,163 @@ type config struct {
 	Interval    time.Duration `mapstructure:"interval"`
 }
 
-func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	s := setup(args, stdout, stderr)
-	if s.exit {
-		return s.code
-	}
-	poller, logger := s.poller, s.logger
+func run(ctx context.Context, stdout io.Writer) int {
+	logger := newLogger(stdout)
 
-	// Step 1: check if previous update failed
-	if !UpdateSuccessful(poller, logger) {
-		level.Info(logger).Log("msg", "failed to update successful update", "path", poller)
-		selfupdate.Rollback()
+	cfg, interval, err := setup(logger)
+	if err != nil {
+		level.Error(logger).Log("msg", "setup", "err", err)
+		return exitUsageError
 	}
 
-	// Step 2: start actual application
-	if err := LaunchApp(logger); err != nil {
+	// Step 1: a marker that survived means the last update never reported
+	// healthy. Before any work that could itself crash.
+	res, err := selfupdate.CheckStartup(cfg)
+	if err != nil {
+		level.Error(logger).Log("msg", "startup check", "err", err)
+	}
+	if res.Reverted {
+		Rollback(cfg, res, err, logger)
+	}
+
+	// Step 2: the real startup work — everything that can fail.
+	if err := launchApp(logger); err != nil {
 		level.Error(logger).Log("msg", "app startup failed", "err", err)
-		selfupdate.Rollback()
 		return exitRuntimeError
 	}
-	// cleanup old update artifacts
-	cleanup(poller)
 
-	// Step 4: poll for new updates
-	return pollForUpdate(ctx, poller, logger)
-}
-
-func UpdateSuccessful(poller *selfupdate.Poller, logger log.Logger) bool {
-	// Startup checks if the previous update failed. If so, it internally:
-	// 1. Restores the .old binary (RestoreOld)
-	// 2. Clears the crash-loop marker
-	// 3. Relaunches into the restored binary (which exits this process via exec)
-	_, err := poller.Startup()
-	if err != nil {
-		level.Error(logger).Log("msg", "rollback check", "err", err)
-		return false
+	// Step 3: and not before. Clears the marker, drops the retained .old.
+	if err := selfupdate.MarkHealthy(cfg); err != nil {
+		level.Error(logger).Log("msg", "mark healthy", "err", err)
 	}
-	return true
+	if err := selfupdate.RemoveOld(cfg.TargetPath); err != nil {
+		level.Error(logger).Log("msg", "remove old binary", "err", err)
+	}
+
+	// Step 4: poll.
+	return pollForUpdate(ctx, cfg, interval, logger)
 }
 
-func LaunchApp(logger log.Logger) error {
-	level.Info(logger).Log("msg",
-		"starting", "app",
-		appName, "version",
-		selfupdate.Version,
-		"os",
-		selfupdate.PlatformKey())
+func Rollback(cfg selfupdate.Config, res selfupdate.StartupResult, checkErr error, logger log.Logger) {
+	// Marker is nil on the unparseable-marker path: there was no attempt
+	// count to trust, so the revert fired without a version pair to report.
+	from, to := "", ""
+	if res.Marker != nil {
+		from, to = res.Marker.FromVersion, res.Marker.ToVersion
+	}
+	level.Warn(logger).Log("msg", "update rolled back", "from", from, "to", to)
+
+	if checkErr != nil {
+		level.Error(logger).Log("msg", "revert incomplete, not relaunching",
+			"target", cfg.TargetPath)
+	} else if err := selfupdate.Relaunch(cfg.TargetPath, os.Args); err != nil {
+		level.Error(logger).Log("msg", "relaunch after rollback", "err", err)
+	}
+}
+
+// launchApp stands in for the application's real startup: whatever must succeed
+// before this generation of the binary can be called healthy.
+func launchApp(logger log.Logger) error {
+	level.Info(logger).Log("msg", "starting",
+		"app", appName,
+		"version", selfupdate.Version,
+		"os", selfupdate.PlatformKey())
 	return nil
 }
 
-func pollForUpdate(ctx context.Context, poller *selfupdate.Poller, logger log.Logger) int {
-	switch err := poller.Poll(ctx); {
-	case errors.Is(err, selfupdate.ErrRestartRequired):
-		level.Info(logger).Log("msg", "shutting down so the updated binary can take over")
-		return exitOK
-	case err != nil:
-		level.Error(logger).Log("msg", "poller run failed", "err", err)
-		return exitRuntimeError
+func pollForUpdate(ctx context.Context, cfg selfupdate.Config,
+	interval time.Duration, logger log.Logger) int {
+
+	for {
+		d, err := selfupdate.CheckForUpdate(ctx, cfg)
+		switch {
+		case err != nil:
+			// Never fatal: an unreachable release host must not take down the
+			// application it exists to maintain.
+			level.Warn(logger).Log("msg", "check failed",
+				"class", selfupdate.ClassOf(err), "err", err)
+		case !d.UpdateAvailable:
+			level.Debug(logger).Log("msg", "no update", "reason", d.Reason)
+		default:
+			if err := selfupdate.ApplyUpdate(ctx, cfg, d); err != nil {
+				level.Error(logger).Log("msg", "apply failed",
+					"class", selfupdate.ClassOf(err), "err", err)
+				break
+			}
+			level.Info(logger).Log("msg", "update applied",
+				"from", d.CurrentVersion, "to", d.Manifest.Version)
+
+			if err := selfupdate.Relaunch(cfg.TargetPath, os.Args); err != nil {
+				// The swap succeeded and the marker is in place; we just could
+				// not hand over. Staying on the old image beats exiting, and
+				// the next start picks up the new binary.
+				level.Warn(logger).Log("msg", "relaunch failed, continuing", "err", err)
+				break
+			}
+			// Unix never reaches here — Relaunch replaced the image. On Windows
+			// the successor is running and this process must exit.
+			level.Info(logger).Log("msg", "exiting for successor")
+			return exitOK
+		}
+
+		select {
+		case <-ctx.Done():
+			return exitOK
+		case <-time.After(nextInterval(interval)):
+		}
 	}
-	return exitOK
 }
 
-func cleanup(poller *selfupdate.Poller) {
-	target := poller.TargetPath
-	g := &selfupdate.Guard{
-		StateDir:    poller.StateDir,
-		BinaryPath:  target,
-		MaxAttempts: poller.MaxStartAttempts,
+// nextInterval returns the base interval plus jitter, to spread load across
+// installs. math/rand is correct here: nothing about it is a security decision.
+func nextInterval(base time.Duration) time.Duration {
+	if base <= 0 {
+		base = defaultPollInterval
 	}
-	if err := selfupdate.MarkHealthy(g); err != nil {
-		level.Error(poller.Logger).Log("msg", "marking update as healthy", "err", err)
-	}
-
+	return base + time.Duration(rand.Float64()*pollJitterFraction*float64(base))
 }
 
-type setupResult struct {
-	poller *selfupdate.Poller
-	logger log.Logger
-	code   int
-	exit   bool
-}
+// setup loads the dotenv and resolves it into the library's Config, returning
+// the base poll interval alongside it.
+func setup(logger log.Logger) (selfupdate.Config, time.Duration, error) {
+	warnIfHTTPAllowed(logger)
 
-// setup parses flags, loads the config file and constructs the poller.
-func setup(args []string, stdout, stderr io.Writer) setupResult {
-	logger := newLogger(stdout)
-
-	envPath, earlyExit := resolveFlags(args, stdout, stderr, logger)
-	if earlyExit != nil {
-		return *earlyExit
-	}
-
-	cfg, err := loadConfig(envPath)
+	c, err := loadConfig(defaultEnvPath)
 	if err != nil {
-		level.Error(logger).Log("msg", "loading config", "path", envPath, "err", err)
-		return setupResult{logger: logger, code: exitUsageError, exit: true}
+		return selfupdate.Config{}, 0, err
 	}
 
-	poller, err := newPoller(cfg, logger)
-	if err != nil {
-		level.Error(logger).Log("msg", "constructing poller", "err", err)
-		return setupResult{logger: logger, code: exitRuntimeError, exit: true}
+	stateDir := c.StateDir
+	if stateDir == "" {
+		if stateDir, err = selfupdate.DefaultStateDir(appName); err != nil {
+			return selfupdate.Config{}, 0, err
+		}
 	}
-	return setupResult{poller: poller, logger: logger}
+
+	cfg, err := selfupdate.NewConfig(c.ManifestURL, c.Target, stateDir)
+	if err != nil {
+		return selfupdate.Config{}, 0, err
+	}
+	return cfg, c.Interval, nil
 }
 
-// newLogger builds the leveled, timestamped logger used for the life of the
-// process, including during flag parsing and config loading.
 func newLogger(stdout io.Writer) log.Logger {
 	logger := level.NewFilter(log.NewLogfmtLogger(stdout), level.AllowAll())
 	return log.With(logger, "ts", log.DefaultTimestampUTC)
 }
 
-func resolveFlags(args []string, stdout, stderr io.Writer, logger log.Logger) (envPath string, earlyExit *setupResult) {
-	envPath, printVersion, err := parseFlags(args, stderr)
-	if err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return "", &setupResult{logger: logger, code: exitOK, exit: true}
-		}
-		level.Error(logger).Log("msg", "parsing flags", "err", err)
-		return "", &setupResult{logger: logger, code: exitUsageError, exit: true}
+// warnIfHTTPAllowed makes the library's SELFUPDATE_ALLOW_HTTP escape hatch
+// visible in the log. It reads through a viper instance of its own so that
+// binding the environment cannot change how the dotenv keys resolve.
+func warnIfHTTPAllowed(logger log.Logger) {
+	env := viper.New()
+	env.AutomaticEnv()
+	if env.GetBool(allowHTTPKey) {
+		level.Warn(logger).Log("msg",
+			"plaintext HTTP permitted for manifest and artifact fetches; "+
+				"an attacker who can rewrite responses controls what this process runs next",
+			"env", "SELFUPDATE_ALLOW_HTTP")
 	}
-	if printVersion {
-		fmt.Fprintf(stdout, "%s %s (%s)\n", appName, selfupdate.Version, selfupdate.PlatformKey())
-		return "", &setupResult{logger: logger, code: exitOK, exit: true}
-	}
-	return envPath, nil
-}
-
-// infoLogf adapts a leveled logger to the Poller.Logf callback shape.
-func infoLogf(logger log.Logger) func(string, ...any) {
-	return func(format string, a ...any) {
-		level.Info(logger).Log("msg", fmt.Sprintf(format, a...))
-	}
-}
-
-func parseFlags(args []string, stderr io.Writer) (envPath string, printVersion bool, err error) {
-	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.StringVar(&envPath, "env", defaultEnvPath, "path to the env file")
-	fs.BoolVar(&printVersion, "version", false, "print the version and exit")
-
-	if err := fs.Parse(args); err != nil {
-		return "", false, err
-	}
-	return envPath, printVersion, nil
 }
 
 func loadConfig(path string) (config, error) {
@@ -224,47 +212,4 @@ func loadConfig(path string) (config, error) {
 		return config{}, fmt.Errorf("%s: manifest_url is required", path)
 	}
 	return cfg, nil
-}
-
-func newPoller(cfg config, logger log.Logger) (*selfupdate.Poller, error) {
-	logf := infoLogf(logger)
-
-	// First, because everything else is pointless without it.
-	verifier, err := selfupdate.TrustedVerifier()
-	if err != nil {
-		return nil, err
-	}
-
-	stateDir := cfg.StateDir
-	if stateDir == "" {
-		if stateDir, err = selfupdate.DefaultStateDir(appName); err != nil {
-			return nil, err
-		}
-	}
-	installID, err := selfupdate.InstallID(stateDir)
-	if err != nil {
-		return nil, err
-	}
-
-	p := &selfupdate.Poller{
-		Checker: &selfupdate.Checker{
-			ManifestURL: cfg.ManifestURL,
-			Verifier:    verifier,
-			InstallID:   installID,
-			UserAgent:   appName + "/" + selfupdate.Version,
-		},
-		Downloader: &selfupdate.Downloader{
-			Progress: func(downloaded, total int64) {
-				if total > 0 {
-					level.Info(logger).Log("msg", "downloading", "percent", downloaded*100/total)
-				}
-			},
-		},
-		TargetPath: cfg.Target,
-		StateDir:   stateDir,
-		Interval:   cfg.Interval,
-		Logf:       logf,
-		Logger:     logger,
-	}
-	return p, nil
 }
