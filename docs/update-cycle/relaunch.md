@@ -2,7 +2,7 @@
 
 **When:** Editing `Relaunch` in `internal/selfupdate/fs.go` or the `execProcess` implementations in `fs_unix.go` / `fs_windows.go`, handling `ErrRestartRequired` in an application, or writing code that runs after a `Relaunch` call.
 
-**Source of truth:** `internal/selfupdate/fs.go` (`Relaunch`, `execProcess`), `internal/selfupdate/fs_unix.go` (`execReplace`, `RelaunchReplacesProcess`), `internal/selfupdate/fs_windows.go` (`execSpawn`, `RelaunchReplacesProcess`), `internal/selfupdate/update.go` (`Poller.UpdateOnce`, `Poller.relaunch`, `ErrRestartRequired`), `self-update-design.md` §2. The code wins if this document disagrees with it.
+**Source of truth:** `internal/selfupdate/fs.go` (`Relaunch`, `execProcess`), `internal/selfupdate/fs_unix.go` (`execReplace`, `RelaunchReplacesProcess`), `internal/selfupdate/fs_windows.go` (`execSpawn`, `RelaunchReplacesProcess`), `internal/selfupdate/update.go` (`Poller.Update`, `Poller.relaunch`, `ErrRestartRequired`), `self-update-design.md` §2. The code wins if this document disagrees with it.
 
 ---
 
@@ -65,7 +65,7 @@ var ErrRestartRequired = errors.New(
 ```
 
 Returned by `Poller.Run` when the caller must shut down. `UpdateResult.RestartPending`
-carries the same signal out of `UpdateOnce`.
+carries the same signal out of `Update`.
 
 On unix this is **never** returned from a successful update, because `Relaunch`
 does not come back. It is the Windows path: the successor is a new process and the
@@ -81,7 +81,7 @@ case errors.Is(err, selfupdate.ErrRestartRequired):
 
 ## Why telemetry must be flushed first
 
-`Poller.UpdateOnce`, once `apply` has succeeded:
+`Poller.Update`, once `apply` has succeeded:
 
 ```go
 p.Reporter.ReportSuccess(d.CurrentVersion, d.Manifest.Version)
@@ -133,7 +133,7 @@ successor, and callers should treat it as "keep running the current process" rat
 than exiting — exiting after a failed relaunch is how a self-updater turns a
 cosmetic problem into an outage.
 
-`Poller.UpdateOnce` implements exactly that:
+`Poller.Update` implements exactly that:
 
 > The swap succeeded, so the update is real and the marker is in place; we simply
 > could not hand over. Staying alive on the old image is strictly better than

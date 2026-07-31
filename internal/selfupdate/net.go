@@ -76,8 +76,8 @@ func requireHTTPS(rawURL string, allowInsecure bool, what string, class ErrorCla
 }
 
 // urlPath returns just the path component of a URL, for error messages. Full
-// URLs in errors are fine locally but end up in telemetry-adjacent logs, so
-// keep the host out of them.
+// URLs in errors are fine locally but end up in shipped logs, so keep the
+// host out of them.
 func urlPath(rawURL string) string {
 	if u, err := url.Parse(rawURL); err == nil && u.Path != "" {
 		return u.Path
@@ -89,13 +89,6 @@ func urlPath(rawURL string) string {
 // reuse survive across polls.
 var defaultDownloadClient = &http.Client{Timeout: defaultFetchTimeout}
 
-// Downloader fetches release artifacts.
-//
-// It downloads the compressed artifact and verifies SHA-256 over those exact
-// bytes — the ones that crossed the wire, which is what the signed manifest
-// covers. Decompression is a separate step that only ever runs on a file this
-// type has already verified: never execute-then-verify, and never decompress
-// unverified bytes either.
 type Downloader struct {
 	Client      *http.Client                  // nil means a sane default client with a timeout
 	MaxAttempts int                           // 0 means default 4
@@ -104,25 +97,11 @@ type Downloader struct {
 	UserAgent   string                        // optional
 }
 
-// Fetch downloads art.URL to destPath, resuming a partial file at destPath if
-// one is present, and verifies SHA-256 over the compressed bytes before
-// returning. destPath contains the verified artifact only on a nil return.
-//
-// On a hash or size mismatch destPath is deleted: a partial that disagrees with
-// the manifest is not a prefix worth resuming, and leaving it in place would
-// poison every subsequent attempt forever.
 func (d *Downloader) Fetch(ctx context.Context, art PlatformArtifact, destPath string) error {
 	const op = "download artifact"
 
-	// art is a copy, so normalizing here cannot surprise the caller.
-	// ParseManifest already lower-cases digests, but Fetch is also reachable
-	// with a hand-built artifact, and a hex digest differing only in case is
-	// the same digest — rejecting it would be a pointless failure.
 	art.SHA256 = strings.ToLower(strings.TrimSpace(art.SHA256))
 
-	// Refuse to make a request at all for an artifact the manifest could not
-	// have legitimately described. Reusing the manifest's own rules keeps a
-	// direct caller from bypassing them.
 	if err := art.validate(); err != nil {
 		return classify(ClassManifestInvalid, op, err)
 	}
@@ -137,9 +116,7 @@ func (d *Downloader) Fetch(ctx context.Context, art PlatformArtifact, destPath s
 	}
 
 	prog := &progressGate{fn: d.Progress, total: art.Size, high: -1}
-	// A per-call source. Fetch is not concurrent with itself over one destPath,
-	// so this needs no lock, and a fresh seed per call is exactly the point:
-	// two processes on the same machine should not draw the same delays.
+
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	var lastErr error
@@ -172,9 +149,6 @@ func (d *Downloader) Fetch(ctx context.Context, art PlatformArtifact, destPath s
 	return classifyf(ClassNetwork, op, "gave up after %d attempts: %w", attempts, lastErr)
 }
 
-// attempt performs one request. It reports whether the failure is worth
-// retrying; a content-level failure (hash, size, manifest) never is, because
-// repeating the request cannot change the answer.
 func (d *Downloader) attempt(ctx context.Context, art PlatformArtifact, destPath string, prog *progressGate) (retry bool, err error) {
 	const op = "download artifact"
 
@@ -187,12 +161,7 @@ func (d *Downloader) attempt(ctx context.Context, art PlatformArtifact, destPath
 	if d.UserAgent != "" {
 		req.Header.Set("User-Agent", d.UserAgent)
 	}
-	// Ask for the stored bytes verbatim. Left alone, the transport advertises
-	// gzip and transparently decompresses, so the bytes we hashed would not be
-	// the bytes the release pipeline signed — and Content-Length would describe
-	// neither. Setting this header also disables that automatic decoding, so a
-	// server that compresses anyway fails the digest check rather than slipping
-	// through.
+
 	req.Header.Set("Accept-Encoding", "identity")
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
@@ -213,14 +182,8 @@ func (d *Downloader) attempt(ctx context.Context, art PlatformArtifact, destPath
 
 	switch resp.StatusCode {
 	case http.StatusOK:
-		// The server ignored Range and is sending the whole artifact.
-		// Appending would concatenate the prefix with a full copy and silently
-		// corrupt the file, so start over from byte zero.
 		offset = 0
 	case http.StatusPartialContent:
-		// Only append if the server confirms it is continuing from exactly
-		// where the file on disk ends. Anything else (missing or disagreeing
-		// Content-Range) is treated as a full restart rather than guessed at.
 		if start, ok := contentRangeStart(resp.Header.Get("Content-Range")); !ok || start != offset {
 			offset = 0
 		}
@@ -240,26 +203,17 @@ func (d *Downloader) attempt(ctx context.Context, art PlatformArtifact, destPath
 
 	remaining := art.Size - offset
 	if resp.ContentLength >= 0 && resp.ContentLength != remaining {
-		// The length the server commits to contradicts the signed manifest.
-		// That is a content disagreement, not a transient blip: retrying cannot
-		// help, and whatever is on disk is not a prefix of the real artifact.
 		_ = os.Remove(destPath)
 		return false, classifyf(ClassHashMismatch, op,
 			"server offers %d bytes from offset %d, manifest says %d", resp.ContentLength, offset, remaining)
 	}
 
-	// A hash cannot be resumed, so the bytes already on disk have to be read
-	// back to seed it. If that fails the prefix is unusable and the download
-	// restarts from zero.
 	h, err := seedHashFromPrefix(destPath, offset)
 	if err != nil {
 		offset, remaining, h = 0, art.Size, sha256.New()
 	}
 	prog.report(offset)
 
-	// Cap reads at the advertised length. Without this a malicious or broken
-	// server can stream forever and fill the user's disk while claiming to
-	// deliver a few megabytes.
 	written, readErr, writeErr := writeArtifactBody(destPath, offset, io.LimitReader(resp.Body, remaining), h, prog)
 	total := offset + written
 

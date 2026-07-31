@@ -12,47 +12,27 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 )
 
-// Checker decides whether a newer release applies to this client.
-//
-// It performs no writes and downloads nothing but the manifest and its
-// signature, so a failed check is always safe to retry and never leaves the
-// installation in a partial state.
 type Checker struct {
-	// ManifestURL is manifest.json's URL; its signature is fetched from this
-	// URL plus ".sig".
-	ManifestURL string
-
-	// Verifier holds the trust set. A nil Verifier is a hard error: see Check.
-	Verifier *Verifier
-
-	// CurrentVersion: empty means the package-level Version var.
+	ManifestURL    string
+	Verifier       *Verifier
 	CurrentVersion string
 
-	// InstallID is used for rollout cohorting. An empty ID still produces a
-	// deterministic decision.
 	InstallID string
 
-	// Platform overrides the "os-arch" manifest key. Empty means PlatformKey().
 	Platform string
 
 	Client    *http.Client
 	UserAgent string
 
-	// MaxManifestBytes overrides defaultMaxManifestBytes.
 	MaxManifestBytes int64
 
-	// AllowInsecureManifestURL permits fetching the manifest over plaintext
-	// HTTP, for local dev only: a network attacker can otherwise suppress an
-	// update indefinitely by serving a stale manifest, which signatures alone
-	// don't prevent.
 	AllowInsecureManifestURL bool
 
-	// AllowInsecureArtifactURL permits a non-HTTPS artifact URL. Independent
-	// of the manifest switch, so a dev setup can serve the manifest locally
-	// while still enforcing the real policy on what gets downloaded and
-	// executed.
 	AllowInsecureArtifactURL bool
 }
 
@@ -70,19 +50,7 @@ type Decision struct {
 	CurrentVersion string
 }
 
-// Check fetches the manifest, verifies its signature, and reports whether this
-// client should update.
-//
-// The order is load bearing. The signature is verified over the exact bytes
-// received, before the document is parsed, so a malformed or hostile manifest
-// is rejected before any of its fields are interpreted. Nothing is downloaded
-// until the manifest is trusted.
-//
-// Errors and "no update" are deliberately different outcomes. A release that
-// omits this platform, or a client outside the rollout cohort, returns a
-// Decision with UpdateAvailable false and a Reason — the poller logs it and
-// carries on. Only a genuine failure (unreachable host, bad signature,
-// malformed document) returns an error.
+// GB change func name to CheckForUpdate
 func (c *Checker) Check(ctx context.Context) (*Decision, error) {
 	const op = "check for update"
 
@@ -177,17 +145,6 @@ func (c *Checker) Check(ctx context.Context) (*Decision, error) {
 	return d, nil
 }
 
-// Marker records that an update was applied and the new binary has not yet
-// reported itself healthy.
-//
-// AppliedAt is recorded for telemetry and diagnostics (the version pair plus the
-// time is what makes a field report legible) and is deliberately *not* part of
-// the revert decision. §3 phrases crash-loop detection as "crashes within N
-// seconds of relaunch", but the marker's mere survival is the stronger signal:
-// counting starts catches a binary that dies after two minutes, or hangs and
-// gets force-quit, neither of which a wall-clock window would notice. A time
-// window also depends on the clock, which is exactly the kind of thing that is
-// wrong on the machines that need rollback most.
 type Marker struct {
 	FromVersion string    `json:"from_version"`
 	ToVersion   string    `json:"to_version"`
@@ -195,9 +152,6 @@ type Marker struct {
 	Attempts    int       `json:"attempts"`
 }
 
-// Guard implements crash-loop detection around an applied update: a marker
-// file written before relaunch, cleared once the new binary calls MarkHealthy.
-// See rollback.md for the mechanism's rationale and its lifecycle diagram.
 type Guard struct {
 	StateDir    string                    // marker lives here
 	BinaryPath  string                    // binary to revert
@@ -214,14 +168,6 @@ type StartupResult struct {
 
 func (g *Guard) markerPath() string { return filepath.Join(g.StateDir, markerFilename) }
 
-// MarkPending is called by the OLD process just before relaunching into the
-// new binary. It writes a fresh marker with Attempts=0 — the new binary has not
-// started yet, so it has not used an attempt.
-//
-// Ordering matters: MarkPending must happen after Apply and before Relaunch. A
-// marker written before the swap would fire a revert on an update that never
-// actually happened; a marker written after the relaunch would never be written
-// at all, because on unix Relaunch does not return.
 func (g *Guard) MarkPending(fromVersion, toVersion string) error {
 	if g.StateDir == "" {
 		return classifyf(ClassInternal, "mark pending", "no state dir configured")
@@ -383,8 +329,9 @@ type Poller struct {
 	// Nil means a default Downloader.
 	Downloader *Downloader
 
-	// Reporter: nil disables telemetry entirely.
-	Reporter *Reporter
+	// Logger: nil discards log lines. Uses the info/warn/error split that
+	// Reporter's Severity used to carry.
+	Logger log.Logger
 
 	// TargetPath: empty means the running executable, with symlinks resolved.
 	TargetPath string
@@ -417,10 +364,9 @@ type Poller struct {
 	// Logf: nil discards log lines.
 	Logf func(format string, args ...any)
 
-	// ReportNoUpdate emits a telemetry event on every "already current" check.
-	// Off by default: it turns the fleet's hourly poll into an hourly beacon —
-	// a useful version census, but a tradeoff in traffic volume that belongs
-	// to the operator.
+	// ReportNoUpdate logs a line on every "already current" check, not just a
+	// change. Off by default: on an hourly poll that's an hourly log line for
+	// no news, which is noise more than signal, so it is opt-in.
 	ReportNoUpdate bool
 }
 
@@ -436,15 +382,16 @@ type UpdateResult struct {
 	RestartPending bool
 }
 
-// Run checks immediately and then on a jittered schedule until ctx is done.
+// Poll checks immediately and then on a jittered schedule until ctx is done.
 //
 // A failed check is logged and retried on the next tick, never returned: the
 // updater is a background concern, and an unreachable release host must not take
-// down the application it is supposed to be maintaining. Run returns nil when
+// down the application it is supposed to be maintaining. Poll returns nil when
 // ctx is done, or ErrRestartRequired when the caller must exit.
-func (p *Poller) Run(ctx context.Context) error {
+// GB change func name to Poll
+func (p *Poller) Poll(ctx context.Context) error {
 	for {
-		res, err := p.UpdateOnce(ctx)
+		res, err := p.Update(ctx)
 		switch {
 		case err != nil && ctx.Err() == nil:
 			p.logf("update check failed (%s): %v", ClassOf(err), err)
@@ -460,14 +407,10 @@ func (p *Poller) Run(ctx context.Context) error {
 	}
 }
 
-// UpdateOnce runs a single cycle.
-//
-// A returned error means the cycle failed; the installation is untouched and the
-// call is safe to retry. A nil error with Applied false is an ordinary outcome:
-// already current, no artifact for this platform, outside the rollout cohort, or
-// declined by the user.
-func (p *Poller) UpdateOnce(ctx context.Context) (UpdateResult, error) {
+// Update runs a single cycle.
+func (p *Poller) Update(ctx context.Context) (UpdateResult, error) {
 	var res UpdateResult
+
 	if p.Checker == nil {
 		return res, classifyf(ClassInternal, "update", "no checker configured")
 	}
@@ -481,7 +424,7 @@ func (p *Poller) UpdateOnce(ctx context.Context) (UpdateResult, error) {
 
 	d, err := p.Checker.Check(ctx)
 	if err != nil {
-		p.Reporter.ReportFailure(p.Checker.CurrentVersion, "", err)
+		logFailure(p.logger(), p.Checker.CurrentVersion, "", err)
 		return res, err
 	}
 	res.Decision = d
@@ -489,11 +432,7 @@ func (p *Poller) UpdateOnce(ctx context.Context) (UpdateResult, error) {
 	if !d.UpdateAvailable {
 		p.logf("no update: %s", d.Reason)
 		if p.ReportNoUpdate {
-			p.Reporter.Report(Event{
-				FromVersion: d.CurrentVersion,
-				Outcome:     OutcomeNoUpdate,
-				Severity:    SeverityInfo,
-			})
+			level.Info(p.logger()).Log("msg", "no update", "version", d.CurrentVersion, "reason", d.Reason)
 		}
 		return res, nil
 	}
@@ -506,15 +445,12 @@ func (p *Poller) UpdateOnce(ctx context.Context) (UpdateResult, error) {
 	}
 
 	if err := p.apply(ctx, target, d); err != nil {
-		p.Reporter.ReportFailure(d.CurrentVersion, d.Manifest.Version, err)
+		logFailure(p.logger(), d.CurrentVersion, d.Manifest.Version, err)
 		return res, err
 	}
 	res.Applied = true
 
-	p.Reporter.ReportSuccess(d.CurrentVersion, d.Manifest.Version)
-	// Drained before the relaunch, not after: on unix the relaunch replaces this
-	// process image, and an in-flight goroutine would be destroyed mid-request.
-	p.Reporter.Wait()
+	level.Info(p.logger()).Log("msg", "update applied", "from", d.CurrentVersion, "to", d.Manifest.Version)
 	p.logf("updated %s to %s", d.CurrentVersion, d.Manifest.Version)
 
 	if err := p.relaunch(target); err != nil {
@@ -614,8 +550,7 @@ func (p *Poller) Startup() (StartupResult, error) {
 		from, to = res.Marker.FromVersion, res.Marker.ToVersion
 	}
 	p.logf("update to %s never reported healthy; reverted to %s", to, from)
-	p.Reporter.ReportRollback(from, to)
-	p.Reporter.Wait()
+	level.Warn(p.logger()).Log("msg", "update rolled back", "from", from, "to", to)
 
 	if err := p.relaunch(target); err != nil {
 		p.logf("could not relaunch the restored binary: %v", err)
@@ -623,14 +558,9 @@ func (p *Poller) Startup() (StartupResult, error) {
 	return res, nil
 }
 
-// MarkHealthy records that this build started successfully, which cancels the
+// HealthCheck records that this build started successfully, which cancels the
 // pending revert and discards the retained previous generation.
-//
-// Call it once the application has finished the startup work that could
-// plausibly fail — after the config is loaded and the listeners are up, not in
-// the first line of main. Calling it too early is the one way to defeat
-// crash-loop protection completely.
-func (p *Poller) MarkHealthy() error {
+func (p *Poller) HealthCheck() error {
 	target, err := p.target()
 	if err != nil {
 		return err
@@ -638,16 +568,11 @@ func (p *Poller) MarkHealthy() error {
 	if err := p.guard(target).MarkHealthy(); err != nil {
 		return err
 	}
-	// Only once no revert is possible or wanted. On Windows this is also what
-	// finally deletes the outgoing .exe the previous process was holding open.
+
 	return RemoveOld(target)
 }
 
 // target resolves the executable to replace, following symlinks.
-//
-// Resolving matters: an install where /usr/local/bin/app symlinks into a
-// versioned directory would otherwise have its symlink replaced by a real file,
-// quietly breaking whatever manages that layout.
 func (p *Poller) target() (string, error) {
 	const op = "resolve target binary"
 
@@ -705,4 +630,23 @@ func (p *Poller) logf(format string, args ...any) {
 		return
 	}
 	p.Logf(format, args...)
+}
+
+func (p *Poller) logger() log.Logger {
+	if p.Logger == nil {
+		return log.NewNopLogger()
+	}
+	return p.Logger
+}
+
+// logFailure logs an update failure at warn, escalated to error for a tamper
+// signal — the same escalation Reporter.ReportFailure used to apply before
+// telemetry was replaced by local logging.
+func logFailure(logger log.Logger, from, to string, err error) {
+	class := ClassOf(err)
+	lvl := level.Warn
+	if class.IsTamperSignal() {
+		lvl = level.Error
+	}
+	lvl(logger).Log("msg", "update failed", "from", from, "to", to, "class", class, "err", err)
 }

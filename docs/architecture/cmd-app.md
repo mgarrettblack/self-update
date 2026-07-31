@@ -37,8 +37,7 @@ in one screen, in order:
    crash-loop marker and the retained `.old` binary, so it has to come after the parts of
    startup that can fail — otherwise crash-loop protection is defeated by construction.
    Also logged at error level on failure, not fatal.
-4. **`poller.Run(ctx)`** for the life of the process — or, under the config's `once: true`,
-   `poller.UpdateOnce(ctx)` and an immediate return before step 4 is reached.
+4. **`poller.Run(ctx)`** for the life of the process.
 
 `setup` exists only to keep this ordering readable — everything it does (flag parsing,
 config loading, poller construction) happens *before* step 1, and none of it is part of
@@ -90,7 +89,6 @@ example):
 | Field | Default | What it is for |
 | --- | --- | --- |
 | `manifest_url` | — | **Required.** Full URL of the signed manifest. The `.sig` URL is derived by appending `.sig`, never configured — that removes a way to misconfigure a client into verifying release A's manifest against release B's signature. |
-| `once` | false | Run one check-and-apply cycle (`UpdateOnce`) and exit instead of polling. The diagnostic field: it makes a single cycle's outcome observable without waiting out a jittered hour. A failure is logged with its `ErrorClass` and the process still exits **0** — `once` is a probe, and an unreachable release host is an ordinary condition. Note it runs *after* steps 1–3, so it also exercises the startup path. |
 | `insecure` | false | Sets **both** `AllowInsecureManifestURL` and `AllowInsecureArtifactURL`, and is the only way to point the client at plain HTTP. For a local release host only: over plaintext a network attacker can suppress an update indefinitely by serving a stale manifest, which signatures do not prevent. The library keeps the two switches independent so a dev setup can serve the manifest locally while still enforcing real policy on what gets executed; the demo collapses them into one field for convenience. |
 | `confirm` | false | Installs a `RequireConfirmation` func that prompts on stdin (`Update available: X -> Y. Install now? [y/N] `). Anything other than an explicit `y`/`yes` declines, **EOF included** — an unattended process whose stdin is closed has not consented to anything. The prompt fires after the release is verified as applicable and *before* anything is downloaded: consent that arrives once the bytes are on disk is not much of a choice. |
 | `state_dir` | `DefaultStateDir("demoapp")` | Where the lock, install id and rollback marker live. Overridable so a second local instance gets its own state — two copies sharing a state dir share a lock file *and* an install id, which changes both single-instance behaviour and rollout cohorting. See [../update-cycle/state-and-markers.md](../update-cycle/state-and-markers.md). |
@@ -102,7 +100,7 @@ example):
 
 | Code | Constant | Meaning |
 | --- | --- | --- |
-| 0 | `exitOK` | Normal exit, `-version`, `-h`, a completed `once: true` cycle, or `ErrRestartRequired` |
+| 0 | `exitOK` | Normal exit, `-version`, `-h`, or `ErrRestartRequired` |
 | 1 | `exitRuntimeError` | Fatal configuration/trust-set problem from `newPoller`, or `Run` returned a real error |
 | 2 | `exitUsageError` | Flag parsing failed, the config file couldn't be read/parsed, or `manifest_url` was missing |
 

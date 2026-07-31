@@ -7,9 +7,6 @@
 # Full URL of the signed release manifest. Required.
 manifest_url: http://127.0.0.1:8099/manifest.json
 
-# Endpoint for update telemetry. Leave empty to disable reporting entirely.
-telemetry_url: ""
-
 # Executable to replace. Leave empty to replace the running executable.
 target: /tmp/install/demoapp
 
@@ -22,9 +19,6 @@ interval: 1h
 
 # Ask on stdin before applying an update.
 confirm: false
-
-# Check once, then exit, instead of polling for the life of the process.
-once: false
 
 # Allow plaintext HTTP for the manifest and artifact. Only for a local
 # release host during development — never set this against a real one.

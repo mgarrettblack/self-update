@@ -56,55 +56,44 @@ func main() {
 
 // config is loaded from the file named by -demo.
 type config struct {
-	ManifestURL  string        `yaml:"manifest_url"`
-	TelemetryURL string        `yaml:"telemetry_url"`
-	Target       string        `yaml:"target"`
-	StateDir     string        `yaml:"state_dir"`
-	Interval     time.Duration `yaml:"interval"`
-	Confirm      bool          `yaml:"confirm"`
-	Once         bool          `yaml:"once"`
-	Insecure     bool          `yaml:"insecure"`
+	ManifestURL string        `yaml:"manifest_url"`
+	Target      string        `yaml:"target"`
+	StateDir    string        `yaml:"state_dir"`
+	Interval    time.Duration `yaml:"interval"`
+	Confirm     bool          `yaml:"confirm"`
+	Insecure    bool          `yaml:"insecure"`
 }
 
-// UnmarshalYAML lets Interval be written as a plain duration string ("1h")
+// ReadConfig lets Interval be written as a plain duration string ("1h")
 // in the config file while staying a time.Duration everywhere else.
-func (c *config) UnmarshalYAML(unmarshal func(any) error) error {
+func (c *config) ReadConfig(unmarshal func(any) error) error {
 	var raw struct {
-		ManifestURL  string `yaml:"manifest_url"`
-		TelemetryURL string `yaml:"telemetry_url"`
-		Target       string `yaml:"target"`
-		StateDir     string `yaml:"state_dir"`
-		Interval     string `yaml:"interval"`
-		Confirm      bool   `yaml:"confirm"`
-		Once         bool   `yaml:"once"`
-		Insecure     bool   `yaml:"insecure"`
+		ManifestURL string `yaml:"manifest_url"`
+		Target      string `yaml:"target"`
+		StateDir    string `yaml:"state_dir"`
+		Interval    string `yaml:"interval"`
+		Confirm     bool   `yaml:"confirm"`
+		Insecure    bool   `yaml:"insecure"`
 	}
 	if err := unmarshal(&raw); err != nil {
 		return err
 	}
 	c.ManifestURL = raw.ManifestURL
-	c.TelemetryURL = raw.TelemetryURL
 	c.Target = raw.Target
 	c.StateDir = raw.StateDir
 	c.Confirm = raw.Confirm
-	c.Once = raw.Once
 	c.Insecure = raw.Insecure
-	if raw.Interval != "" {
-		d, err := time.ParseDuration(raw.Interval)
-		if err != nil {
-			return fmt.Errorf("interval: %w", err)
-		}
-		c.Interval = d
-	}
+	c.Interval, _ = time.ParseDuration(raw.Interval)
+
 	return nil
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
-	poller, logger, once, code, exit := setup(args, stdout, stderr)
-	if exit {
-		return code
+	s := setup(args, stdout, stderr)
+	if s.exit {
+		return s.code
 	}
-	logf := infoLogf(logger)
+	poller, logger := s.poller, s.logger
 
 	// Step 1, before any work that could plausibly crash: reverts and
 	// relaunches if the previous post-update start never got healthy.
@@ -114,29 +103,19 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	// === put your application's own startup here ===
 	// Step 2: the application's real startup would go here.
-	logf("%s %s starting on %s", appName, selfupdate.Version, selfupdate.PlatformKey())
+	level.Info(logger).Log("msg", "starting", "app", appName, "version", selfupdate.Version, "os", selfupdate.PlatformKey())
 	// === end application startup ===
 
 	// Step 3, not before: MarkHealthy discards the retained previous binary,
 	// so crash-loop protection depends on it running after startup can fail.
-	if err := poller.MarkHealthy(); err != nil {
+	if err := poller.HealthCheck(); err != nil {
 		level.Error(logger).Log("msg", "marking this build healthy", "err", err)
 	}
 
-	if once {
-		// A single check-and-apply cycle. Any failure is reported, not fatal:
-		// once is a diagnostic, and an unreachable release host is an ordinary
-		// condition.
-		if _, err := poller.UpdateOnce(ctx); err != nil {
-			level.Info(logger).Log("msg", "update check failed", "class", selfupdate.ClassOf(err), "err", err)
-		}
-		return exitOK
-	}
-
 	// Step 4: poll for the life of the process.
-	switch err := poller.Run(ctx); {
+	switch err := poller.Poll(ctx); {
 	case errors.Is(err, selfupdate.ErrRestartRequired):
-		logf("shutting down so the updated binary can take over")
+		level.Info(logger).Log("msg", "shutting down so the updated binary can take over")
 		return exitOK
 	case err != nil:
 		level.Error(logger).Log("msg", "poller run failed", "err", err)
@@ -145,38 +124,57 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	return exitOK
 }
 
-// setup parses flags, loads the config file and constructs the poller. When
-// exit is true the caller should return code immediately without running the
-// update cycle — this covers -h, -version and any setup failure.
-func setup(args []string, stdout, stderr io.Writer) (poller *selfupdate.Poller, logger log.Logger, once bool, code int, exit bool) {
-	logger = level.NewFilter(log.NewLogfmtLogger(stdout), level.AllowAll())
-	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
+type setupResult struct {
+	poller *selfupdate.Poller
+	logger log.Logger
+	code   int
+	exit   bool
+}
 
-	demoPath, printVersion, err := parseFlags(args, stderr)
-	if err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			return nil, logger, false, exitOK, true
-		}
-		level.Error(logger).Log("msg", "parsing flags", "err", err)
-		return nil, logger, false, exitUsageError, true
-	}
-	if printVersion {
-		fmt.Fprintf(stdout, "%s %s (%s)\n", appName, selfupdate.Version, selfupdate.PlatformKey())
-		return nil, logger, false, exitOK, true
+// setup parses flags, loads the config file and constructs the poller.
+func setup(args []string, stdout, stderr io.Writer) setupResult {
+	logger := newLogger(stdout)
+
+	demoPath, earlyExit := resolveFlags(args, stdout, stderr, logger)
+	if earlyExit != nil {
+		return *earlyExit
 	}
 
 	cfg, err := loadConfig(demoPath)
 	if err != nil {
 		level.Error(logger).Log("msg", "loading config", "path", demoPath, "err", err)
-		return nil, logger, false, exitUsageError, true
+		return setupResult{logger: logger, code: exitUsageError, exit: true}
 	}
 
-	p, err := newPoller(cfg, infoLogf(logger), stdout)
+	poller, err := newPoller(cfg, logger, stdout)
 	if err != nil {
 		level.Error(logger).Log("msg", "constructing poller", "err", err)
-		return nil, logger, false, exitRuntimeError, true
+		return setupResult{logger: logger, code: exitRuntimeError, exit: true}
 	}
-	return p, logger, cfg.Once, exitOK, false
+	return setupResult{poller: poller, logger: logger}
+}
+
+// newLogger builds the leveled, timestamped logger used for the life of the
+// process, including during flag parsing and config loading.
+func newLogger(stdout io.Writer) log.Logger {
+	logger := level.NewFilter(log.NewLogfmtLogger(stdout), level.AllowAll())
+	return log.With(logger, "ts", log.DefaultTimestampUTC)
+}
+
+func resolveFlags(args []string, stdout, stderr io.Writer, logger log.Logger) (demoPath string, earlyExit *setupResult) {
+	demoPath, printVersion, err := parseFlags(args, stderr)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return "", &setupResult{logger: logger, code: exitOK, exit: true}
+		}
+		level.Error(logger).Log("msg", "parsing flags", "err", err)
+		return "", &setupResult{logger: logger, code: exitUsageError, exit: true}
+	}
+	if printVersion {
+		fmt.Fprintf(stdout, "%s %s (%s)\n", appName, selfupdate.Version, selfupdate.PlatformKey())
+		return "", &setupResult{logger: logger, code: exitOK, exit: true}
+	}
+	return demoPath, nil
 }
 
 // infoLogf adapts a leveled logger to the Poller.Logf callback shape.
@@ -213,7 +211,9 @@ func loadConfig(path string) (config, error) {
 	return cfg, nil
 }
 
-func newPoller(cfg config, logf func(string, ...any), stdout io.Writer) (*selfupdate.Poller, error) {
+func newPoller(cfg config, logger log.Logger, stdout io.Writer) (*selfupdate.Poller, error) {
+	logf := infoLogf(logger)
+
 	// First, because everything else is pointless without it.
 	verifier, err := selfupdate.TrustedVerifier()
 	if err != nil {
@@ -243,7 +243,7 @@ func newPoller(cfg config, logf func(string, ...any), stdout io.Writer) (*selfup
 		Downloader: &selfupdate.Downloader{
 			Progress: func(downloaded, total int64) {
 				if total > 0 {
-					logf("downloading: %d%%", downloaded*100/total)
+					level.Info(logger).Log("msg", "downloading", "percent", downloaded*100/total)
 				}
 			},
 		},
@@ -251,9 +251,7 @@ func newPoller(cfg config, logf func(string, ...any), stdout io.Writer) (*selfup
 		StateDir:   stateDir,
 		Interval:   cfg.Interval,
 		Logf:       logf,
-	}
-	if cfg.TelemetryURL != "" {
-		p.Reporter = &selfupdate.Reporter{Endpoint: cfg.TelemetryURL, InstallID: installID}
+		Logger:     logger,
 	}
 	if cfg.Confirm {
 		p.RequireConfirmation = confirmFunc(os.Stdin, stdout)
@@ -261,10 +259,6 @@ func newPoller(cfg config, logf func(string, ...any), stdout io.Writer) (*selfup
 	return p, nil
 }
 
-// confirmFunc prompts before applying an update.
-//
-// Anything other than an explicit yes declines, EOF included: an unattended
-// process whose stdin is closed has not consented to anything.
 func confirmFunc(in io.Reader, out io.Writer) func(*selfupdate.Decision) bool {
 	return func(d *selfupdate.Decision) bool {
 		fmt.Fprintf(out, "Update available: %s -> %s. Install now? [y/N] ",

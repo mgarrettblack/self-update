@@ -166,14 +166,8 @@ func allDigits(s string) (int, bool) {
 }
 
 // Manifest is the signed release description served as manifest.json.
-//
-// Unknown fields are deliberately tolerated on decode so that adding a field
-// later (release channels, for instance) does not break already-deployed
-// clients that predate it.
 type Manifest struct {
-	Version string `json:"version"`
-	// Rollout is a pointer so an omitted field is distinguishable from an
-	// explicit 0. Read it through RolloutPercent.
+	Version   string                      `json:"version"`
 	Rollout   *int                        `json:"rollout,omitempty"`
 	Platforms map[string]PlatformArtifact `json:"platforms"`
 }

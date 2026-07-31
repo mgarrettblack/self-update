@@ -104,7 +104,7 @@ Three outcomes return a `Decision` with `UpdateAvailable: false`, a populated
 | no artifact for this platform | `release Y publishes no artifact for os-arch` |
 | outside the rollout cohort | `release Y is at N% rollout and this install is not in the cohort` |
 
-`Poller.UpdateOnce` logs the reason and carries on. Only a genuine failure —
+`Poller.Update` logs the reason and carries on. Only a genuine failure —
 unreachable host, bad signature, malformed document, non-HTTPS artifact URL —
 returns an error.
 

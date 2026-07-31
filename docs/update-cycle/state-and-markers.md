@@ -129,7 +129,7 @@ decompression that produced it.
   [rollback](rollback.md).
 - A failed relaunch leaves marker present, `.old` present, and the process still
   running the *old* version: `MarkPending` is the last thing `Poller.apply` does, and
-  `Poller.UpdateOnce` logs a relaunch failure and stays on the old image rather than
+  `Poller.Update` logs a relaunch failure and stays on the old image rather than
   exiting. The new binary's one attempt is then consumed by whenever it actually
   starts.
 - `cmd/app`'s `state_dir` config field points the whole thing at a scratch directory,

@@ -132,11 +132,11 @@ execute-then-verify*, and the only execution of new bytes is `Relaunch` on the t
 path *after* `Apply` has already put verified content there.
 
 `Poller.apply` writes the crash-loop marker between the swap and the relaunch —
-`MarkPending` after `Apply`, and the relaunch does not happen until `UpdateOnce` calls
+`MarkPending` after `Apply`, and the relaunch does not happen until `Update` calls
 it. Both edges are load-bearing: earlier fires a revert for an update that never
 happened, later never runs at all, because on unix `Relaunch` replaces the process image
 and does not return. Telemetry is drained (`Reporter.Wait`) before the relaunch for the
-same reason — that drain, and the relaunch itself, live in `UpdateOnce` rather than
+same reason — that drain, and the relaunch itself, live in `Update` rather than
 `apply`, because `apply` returns while the lock's deferred cleanup still has to run.
 Neither is a verification step, but both live inside this sequence and cannot be moved
 out of it. See [../update-cycle/rollback.md](../update-cycle/rollback.md) and

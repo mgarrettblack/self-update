@@ -37,7 +37,7 @@ deliberately rather than quietly edited:
 - `Poller.Relaunch` in `update.go` — "replaces the platform's relaunch, for tests."
 - `Reporter.Wait` in `telemetry.go` — "For tests and for a clean shutdown only — the update
   path never calls it." This one is doubly wrong: `Wait` is called on the update path, in
-  both `Poller.UpdateOnce` and `Poller.Startup`. See
+  both `Poller.Update` and `Poller.Startup`. See
   [../observability/telemetry-events.md](../observability/telemetry-events.md).
 - `backoffDelay` in `net.go` — "keeps the function usable from tests."
 

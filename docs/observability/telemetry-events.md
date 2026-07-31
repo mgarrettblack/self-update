@@ -88,7 +88,7 @@ The severity decision for a failure is two lines inside `ReportFailure`; there i
 not `alert`, and the reasoning is worth preserving: the binary that was installed *is* the
 one that was signed, it simply did not stay up. That is a bad release, not an attack.
 
-A fourth event exists but has no convenience method. `Poller.UpdateOnce` emits an
+A fourth event exists but has no convenience method. `Poller.Update` emits an
 `Outcome: no_update` / `SeverityInfo` event directly via `Reporter.Report`, and only when
 `Poller.ReportNoUpdate` is set. It is off by default because it turns the fleet's hourly
 poll into an hourly beacon — a useful version census and a large volume of traffic, and
@@ -116,7 +116,7 @@ opposite.
 `Reporter.Wait()` joins in-flight sends. The update path calls it in exactly two places,
 both immediately before a relaunch:
 
-- `Poller.UpdateOnce` — `ReportSuccess` then `Wait` then `p.relaunch(target)`.
+- `Poller.Update` — `ReportSuccess` then `Wait` then `p.relaunch(target)`.
 - `Poller.Startup` — `ReportRollback` then `Wait` then `p.relaunch(target)`.
 
 **Drained before the relaunch, not after, because on unix `Relaunch` replaces the
@@ -132,7 +132,7 @@ invariants on the update cycle; see
 **The doc comment on `Wait` is stale and says the opposite.** It reads "For tests and for
 a clean shutdown only — the update path never calls it," which was true before the drain
 ordering was introduced and is now contradicted by the two call sites above — both of
-which are on the update path, and one of which (`UpdateOnce`) is the update path's
+which are on the update path, and one of which (`Update`) is the update path's
 happy case. Trust the call sites. The comment has been left alone deliberately rather
 than quietly corrected here; if you are in `telemetry.go` for another reason, it is worth
 fixing at the source.

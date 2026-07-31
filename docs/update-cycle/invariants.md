@@ -1,15 +1,15 @@
 # The six invariants of the update cycle
 
-**When:** Before reordering, inlining, extracting or short-circuiting any step in `Poller.UpdateOnce` / `Poller.apply`, or before adding a new step to the cycle. Read this first if you are touching `update.go`.
+**When:** Before reordering, inlining, extracting or short-circuiting any step in `Poller.Update` / `Poller.apply`, or before adding a new step to the cycle. Read this first if you are touching `update.go`.
 
-**Source of truth:** `internal/selfupdate/update.go` (`Checker.Check`, `Poller.UpdateOnce`, `Poller.apply`, `Guard.MarkPending`), `internal/selfupdate/fs.go` (`Apply`, `DecompressFile`), `internal/selfupdate/net.go` (`Downloader.Fetch`), `internal/selfupdate/doc.go`, `self-update-design.md` §1, §2, §3. The code wins if this document disagrees with it.
+**Source of truth:** `internal/selfupdate/update.go` (`Checker.Check`, `Poller.Update`, `Poller.apply`, `Guard.MarkPending`), `internal/selfupdate/fs.go` (`Apply`, `DecompressFile`), `internal/selfupdate/net.go` (`Downloader.Fetch`), `internal/selfupdate/doc.go`, `self-update-design.md` §1, §2, §3. The code wins if this document disagrees with it.
 
 ---
 
 ## The sequence
 
 ```
-UpdateOnce
+Update
   Checker.Check                      -> Decision
   RequireConfirmation (optional)
   apply:
@@ -20,7 +20,7 @@ UpdateOnce
     Apply      -> swap onto <target>
     MarkPending                      (marker written)
     defer: remove both staging files, then release the lock
-  back in UpdateOnce:
+  back in Update:
     Reporter.ReportSuccess
     Reporter.Wait                    (drain)
     Relaunch
@@ -116,7 +116,7 @@ target's directory, not a temp directory elsewhere. See
 ## 5. Marker after the swap, before the relaunch
 
 `Poller.apply` calls `MarkPending` as its last statement, after `Apply` succeeded
-and before `UpdateOnce` relaunches.
+and before `Update` relaunches.
 
 **Written earlier:** the marker describes an update that may never happen. If the
 download or the swap then fails, the next start finds a marker, counts an attempt,
@@ -132,7 +132,7 @@ See [rollback](rollback.md) and [state and markers](state-and-markers.md).
 
 ## 6. Telemetry is drained before the relaunch
 
-`Poller.UpdateOnce` calls `Reporter.ReportSuccess` and then `Reporter.Wait()`
+`Poller.Update` calls `Reporter.ReportSuccess` and then `Reporter.Wait()`
 before `p.relaunch(target)`. `Poller.Startup` does the same around
 `ReportRollback`.
 

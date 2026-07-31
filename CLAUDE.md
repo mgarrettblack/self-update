@@ -49,7 +49,7 @@ Three are worth reading *before* you touch the thing they describe, not after:
 
 | Doc | When |
 | --- | --- |
-| [invariants.md](docs/update-cycle/invariants.md) | **Before** reordering, inlining or adding any step in `UpdateOnce` / `apply` |
+| [invariants.md](docs/update-cycle/invariants.md) | **Before** reordering, inlining or adding any step in `Update` / `apply` |
 | [lifecycle-ordering.md](docs/update-cycle/lifecycle-ordering.md) | Wiring into an app's `main`; moving any `Startup` / `MarkHealthy` / `Run` call |
 | [check.md](docs/update-cycle/check.md) | Editing `Checker`; debugging a spurious "no update" |
 | [rollout-cohorts.md](docs/update-cycle/rollout-cohorts.md) | Editing `InRolloutCohort`; "why did this client not get the release" |
@@ -115,7 +115,7 @@ go build -ldflags "\
 
 `$PUBKEY` is a comma-separated list of standard-base64 Ed25519 public keys. The demo
 app takes a single `-demo <path>` flag (default `demo_config.yml`) naming a YAML file
-with `once`, `insecure`, `confirm` and `state_dir` fields for driving it against a
+with `insecure`, `confirm` and `state_dir` fields for driving it against a
 local release host; `insecure` is the only way to point it at plain HTTP. See
 `demo_config.yml` at the repo root for a commented example, and
 [docs/architecture/cmd-app.md](docs/architecture/cmd-app.md) for the full field table.
@@ -147,13 +147,15 @@ cat > /tmp/host/demo_config.yml <<'CFG'
 manifest_url: http://127.0.0.1:8099/manifest.json
 state_dir: /tmp/st
 target: /tmp/install/demoapp
-once: true
 insecure: true
 CFG
 
 python3 -m http.server 8099 --directory /tmp/host &
 /tmp/install/demoapp -demo /tmp/host/demo_config.yml
 ```
+
+The demo polls for the life of the process, so it will not exit on its own — interrupt
+it (Ctrl+C) once the expected log line appears, then inspect state.
 
 Expect `updated 1.0.0 to 9.9.9` followed by the successor process starting, no `.old`
 /`.download`/`.new` left in `/tmp/install`, and no marker in `/tmp/st`.
@@ -163,7 +165,8 @@ fail silently if broken. Flipping a byte in `a.zst` after signing must give
 `hash_mismatch`; editing `manifest.json` after signing must give `signature_invalid`;
 removing `manifest.json.sig` must fail rather than proceed unsigned; and setting
 `insecure: false` (or omitting it) must be refused on scheme. In all four the target
-binary must be left at 1.0.0.
+binary must be left at 1.0.0 — interrupt the process once the failure is logged; it
+will otherwise retry on the next jittered interval rather than exiting.
 
 ## Architecture
 
@@ -205,7 +208,7 @@ in `update.go`'s attempt accounting assumes this placement.
 
 ### The update cycle (`update.go`)
 
-`UpdateOnce` → `Checker.Check` → optional `RequireConfirmation` → `Poller.apply`, which
+`Update` → `Checker.Check` → optional `RequireConfirmation` → `Poller.apply`, which
 under a `flock` held for the whole cycle does: space preflight → download to
 `<target>.download` → decompress to `<target>.new` → `Apply` (swap) → `MarkPending` →
 relaunch. Staging files are removed on every exit path.

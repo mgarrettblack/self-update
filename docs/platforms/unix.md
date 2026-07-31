@@ -129,7 +129,7 @@ resolution, a stat preflight (worth a syscall precisely because a failure *after
 point of no return is unrecoverable here), copying `argv` so `os.Args` is not mutated,
 defaulting `argv[0]`, and classifying a permission failure as `ClassPermissionDenied`.
 
-`ErrRestartRequired` is therefore not part of the unix success path: `Poller.UpdateOnce`
+`ErrRestartRequired` is therefore not part of the unix success path: `Poller.Update`
 only sets `UpdateResult.RestartPending` when the relaunch *returns* nil, which the real
 unix `Relaunch` cannot do. It is reachable on a unix host only through the
 `Poller.Relaunch` seam. See [windows.md](windows.md), where it is the normal outcome, and

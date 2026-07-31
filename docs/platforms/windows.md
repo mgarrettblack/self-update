@@ -122,7 +122,7 @@ over-optimistic number and no error at all. See
 `execSpawn` — registered as `execProcess` by this file's `init()` — starts a child and
 returns.
 
-**This is why `ErrRestartRequired` exists.** `Poller.UpdateOnce` sets
+**This is why `ErrRestartRequired` exists.** `Poller.Update` sets
 `UpdateResult.RestartPending` when the relaunch returns nil, and `Poller.Run` turns that
 into `ErrRestartRequired` — "update applied: this process must exit so its successor can
 take over." The caller MUST shut down and exit: the old process keeps `app.exe.old` open,

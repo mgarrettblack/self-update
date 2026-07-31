@@ -43,7 +43,7 @@ half-cleaned state in between.
 
 The lock is *not* held across `Checker.Check` (read-only, harmless to run
 concurrently) and *not* held across the relaunch, which happens back up in
-`Poller.UpdateOnce` after `apply` has returned and the defer has run. It is
+`Poller.Update` after `apply` has returned and the defer has run. It is
 therefore released between cycles rather than held for the process lifetime, so a
 long-lived instance does not starve every other copy on the machine forever.
 
