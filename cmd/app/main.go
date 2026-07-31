@@ -41,7 +41,7 @@ type config struct {
 func run(ctx context.Context, stdout io.Writer) int {
 	logger := newLogger(stdout)
 
-	cfg, interval, err := setup(logger)
+	cfg, interval, err := setup()
 	if err != nil {
 		level.Error(logger).Log("msg", "setup", "err", err)
 		return exitUsageError
@@ -58,18 +58,17 @@ func run(ctx context.Context, stdout io.Writer) int {
 		level.Error(logger).Log("msg", "app startup failed", "err", err)
 		return exitRuntimeError
 	}
+	// cleanup old artifacts
 	cleanup(cfg, logger)
 
 	// Step 3: poll for new updates
 	return pollForUpdate(ctx, cfg, interval, logger)
 }
 
-// launchApp stands in for the application's real startup: whatever must succeed
-// before this generation of the binary can be called healthy.
 func launchApp(logger log.Logger) error {
 	level.Info(logger).Log("msg", "starting",
 		"app", appName,
-		"version", selfupdate.Version,
+		"version", selfupdate.CurrentVersion,
 		"os", selfupdate.PlatformKey())
 	return nil
 }
@@ -87,18 +86,18 @@ func pollForUpdate(ctx context.Context, cfg selfupdate.Config,
 	interval time.Duration, logger log.Logger) int {
 
 	for {
-		d, err := selfupdate.CheckForUpdate(ctx, cfg)
+		available, err := selfupdate.CheckForUpdate(ctx, cfg)
 		switch {
 		case err != nil:
 			level.Warn(logger).Log("msg", "check failed", "err", err)
-		case !d.UpdateAvailable:
+		case !available:
 			level.Debug(logger).Log("msg", "no update")
 		default:
-			if err := selfupdate.ApplyUpdate(ctx, cfg, d); err != nil {
+			if err := selfupdate.ApplyUpdate(ctx, cfg); err != nil {
 				level.Error(logger).Log("msg", "apply failed", "err", err)
 				break
 			}
-			level.Info(logger).Log("msg", "update applied", "from", d.CurrentVersion, "to", d.Manifest.Version)
+			level.Info(logger).Log("msg", "update applied")
 
 			if err := selfupdate.Relaunch(cfg.TargetPath, os.Args); err != nil {
 				level.Warn(logger).Log("msg", "relaunch failed, continuing", "err", err)

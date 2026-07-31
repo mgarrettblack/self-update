@@ -17,9 +17,9 @@ import (
 	"time"
 )
 
-// fetchBytes issues a GET against rawURL and returns its body, capped at max
-// bytes. It is used for both the manifest and its detached signature.
-func fetchBytes(ctx context.Context, client *http.Client, rawURL string, max int64) ([]byte, error) {
+// fetchManifest issues a GET against rawURL, parses the response body as a
+// manifest, and returns the parsed manifest. The response is capped at max bytes.
+func fetchManifest(ctx context.Context, client *http.Client, rawURL string, max int64) (*Manifest, error) {
 	op := "fetch " + urlPath(rawURL)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -52,25 +52,12 @@ func fetchBytes(ctx context.Context, client *http.Client, rawURL string, max int
 	if int64(len(data)) > max {
 		return nil, fmt.Errorf("%s: response exceeds the %d byte limit", op, max)
 	}
-	return data, nil
-}
 
-// requireHTTPS enforces transport security on a URL. The only waiver is
-// SELFUPDATE_ALLOW_HTTP; see allowHTTP for why that is development-only.
-func requireHTTPS(rawURL string, what string) error {
-	op := "validate " + what + " URL"
-
-	u, err := url.Parse(rawURL)
+	manifest, err := ParseManifest(data)
 	if err != nil {
-		return fmt.Errorf("%s: %q is not a valid URL: %v", op, rawURL, err)
+		return nil, err
 	}
-	if u.Scheme == "https" {
-		return nil
-	}
-	if allowHTTP() {
-		return nil
-	}
-	return fmt.Errorf("%s: %s URL uses scheme %q; HTTPS is required", op, what, u.Scheme)
+	return manifest, nil
 }
 
 // urlPath returns just the path component of a URL, for error messages. Full

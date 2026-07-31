@@ -12,8 +12,8 @@ import (
 	"strings"
 )
 
-// Version is overwritten at link time
-var Version = "0.0.0-dev"
+// CurrentVersion is overwritten at link time
+const CurrentVersion = "0.0.0-dev"
 
 // Semver is a parsed semantic version
 type Semver struct {

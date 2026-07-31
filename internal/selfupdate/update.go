@@ -88,60 +88,39 @@ type Decision struct {
 
 var checkClient = &http.Client{Timeout: defaultCheckTimeout}
 
-func CheckForUpdate(ctx context.Context, cfg Config) (*Decision, error) {
+func CheckForUpdate(ctx context.Context, cfg Config) (bool, error) {
 	const op = "check for update"
 
+	// Step 1: Validate the manifest URL is configured.
 	if strings.TrimSpace(cfg.ManifestURL) == "" {
-		return nil, fmt.Errorf("%s: manifest URL is empty", op)
-	}
-	if err := requireHTTPS(cfg.ManifestURL, "manifest"); err != nil {
-		return nil, err
+		return false, fmt.Errorf("%s: manifest URL is empty", op)
 	}
 
-	// The ldflag-stamped build version is the only honest answer to "what is
-	// running", so it is not overridable: a caller who could lie about it
-	// could talk this process into installing an older release.
-	current := Version
-	if _, err := parseSemver(current); err != nil {
-		return nil, fmt.Errorf("%s: running version %q is not valid semver: %v", op, current, err)
-	}
-
-	body, err := fetchBytes(ctx, checkClient, cfg.ManifestURL, defaultMaxManifestBytes)
+	// Step 2: Fetch and parse the manifest from the URL.
+	manifest, err := fetchManifest(ctx, checkClient, cfg.ManifestURL, defaultMaxManifestBytes)
 	if err != nil {
-		return nil, err
+		return false, err
 	}
 
-	m, err := ParseManifest(body)
-	if err != nil {
-		return nil, err
-	}
+	// Step 3: Check if the published version is newer than the running version.
+	return IsNewer(manifest.Version, CurrentVersion)
+}
 
-	d := &Decision{Manifest: m, CurrentVersion: current}
-
-	newer, err := IsNewer(m.Version, current)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", op, err)
-	}
-	if !newer {
-		// Covers both "same version" and a rolled-back manifest advertising an
-		// older release; neither should move this client.
-		d.Reason = fmt.Sprintf("running %s, published release is %s", current, m.Version)
-		return d, nil
-	}
-
+	// Step 4: Get the platform-specific artifact for this system.
 	platform := PlatformKey()
-	art, err := m.Artifact(platform)
+	art, err := manifest.Artifact(platform)
 	if err != nil {
-		d.Reason = fmt.Sprintf("release %s publishes no artifact for %s", m.Version, platform)
 		return d, nil
 	}
+
+	// Step 5: Verify the artifact URL uses HTTPS (unless explicitly allowed).
 	if err := requireHTTPS(art.URL, "artifact"); err != nil {
 		return nil, err
 	}
 
+	// Step 6: Mark the update as available.
 	d.Artifact = art
 	d.UpdateAvailable = true
-	d.Reason = fmt.Sprintf("update available: %s to %s", current, m.Version)
 	return d, nil
 }
 
