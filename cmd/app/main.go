@@ -70,32 +70,23 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	}
 	poller, logger := s.poller, s.logger
 
-	// Step 1, before any work that could plausibly crash: reverts and
-	// relaunches if the previous post-update start never got healthy.
+	// Step 1: check if previous update failed
 	if !UpdateSuccessful(poller, logger) {
 		level.Info(logger).Log("msg", "failed to update successful update", "path", poller)
 		selfupdate.Rollback()
 	}
 
-	// Step 2: the application's real startup.
-	LaunchApp(logger)
-
-	// Step 3, not before: MarkHealthy discards the retained previous binary,
-	// so crash-loop protection depends on it running after startup can fail.
-	if err := poller.HealthCheck(); err != nil {
-		level.Error(logger).Log("msg", "marking this build healthy", "err", err)
-	}
-
-	// Step 4: poll for the life of the process.
-	switch err := poller.Poll(ctx); {
-	case errors.Is(err, selfupdate.ErrRestartRequired):
-		level.Info(logger).Log("msg", "shutting down so the updated binary can take over")
-		return exitOK
-	case err != nil:
-		level.Error(logger).Log("msg", "poller run failed", "err", err)
+	// Step 2: start actual application
+	if err := LaunchApp(logger); err != nil {
+		level.Error(logger).Log("msg", "app startup failed", "err", err)
+		selfupdate.Rollback()
 		return exitRuntimeError
 	}
-	return exitOK
+	// cleanup old update artifacts
+	cleanup(poller)
+
+	// Step 4: poll for new updates
+	return pollForUpdate(ctx, poller, logger)
 }
 
 func UpdateSuccessful(poller *selfupdate.Poller, logger log.Logger) bool {
@@ -111,13 +102,39 @@ func UpdateSuccessful(poller *selfupdate.Poller, logger log.Logger) bool {
 	return true
 }
 
-func LaunchApp(logger log.Logger) {
+func LaunchApp(logger log.Logger) error {
 	level.Info(logger).Log("msg",
 		"starting", "app",
 		appName, "version",
 		selfupdate.Version,
 		"os",
 		selfupdate.PlatformKey())
+	return nil
+}
+
+func pollForUpdate(ctx context.Context, poller *selfupdate.Poller, logger log.Logger) int {
+	switch err := poller.Poll(ctx); {
+	case errors.Is(err, selfupdate.ErrRestartRequired):
+		level.Info(logger).Log("msg", "shutting down so the updated binary can take over")
+		return exitOK
+	case err != nil:
+		level.Error(logger).Log("msg", "poller run failed", "err", err)
+		return exitRuntimeError
+	}
+	return exitOK
+}
+
+func cleanup(poller *selfupdate.Poller) {
+	target := poller.TargetPath
+	g := &selfupdate.Guard{
+		StateDir:    poller.StateDir,
+		BinaryPath:  target,
+		MaxAttempts: poller.MaxStartAttempts,
+	}
+	if err := selfupdate.MarkHealthy(g); err != nil {
+		level.Error(poller.Logger).Log("msg", "marking update as healthy", "err", err)
+	}
+
 }
 
 type setupResult struct {
