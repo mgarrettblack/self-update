@@ -166,9 +166,9 @@ type StartupResult struct {
 	Marker   *Marker // the marker that was found, if any
 }
 
-func (g *Guard) markerPath() string { return filepath.Join(g.StateDir, markerFilename) }
+func markerPath(g *Guard) string { return filepath.Join(g.StateDir, markerFilename) }
 
-func (g *Guard) MarkPending(fromVersion, toVersion string) error {
+func MarkPending(g *Guard, fromVersion, toVersion string) error {
 	if g.StateDir == "" {
 		return classifyf(ClassInternal, "mark pending", "no state dir configured")
 	}
@@ -186,19 +186,19 @@ func (g *Guard) MarkPending(fromVersion, toVersion string) error {
 		AppliedAt:   now(),
 		Attempts:    0,
 	}
-	return g.writeMarker(m)
+	return writeMarker(g, m)
 }
 
 // CheckStartup runs once at process start, before any real startup work, and
 // reverts to the previous binary if a marker survived from an update that
 // never reached MarkHealthy. See rollback.md for the attempt-accounting
 // walkthrough and what StartupResult.Reverted means for the caller.
-func (g *Guard) CheckStartup() (StartupResult, error) {
+func CheckStartup(g *Guard) (StartupResult, error) {
 	if g.StateDir == "" {
 		return StartupResult{}, classifyf(ClassInternal, "check startup", "no state dir configured")
 	}
 
-	data, err := os.ReadFile(g.markerPath())
+	data, err := os.ReadFile(markerPath(g))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return StartupResult{}, nil
@@ -208,34 +208,21 @@ func (g *Guard) CheckStartup() (StartupResult, error) {
 
 	var m Marker
 	if err := json.Unmarshal(data, &m); err != nil {
-		// A corrupt or truncated marker is never treated as fatal: refusing to
-		// start would wedge the app permanently over an unreadable bookkeeping
-		// file, which is a worse outcome than any update failure. It is also
-		// not treated as "no update pending" — the file only exists at all
-		// because an update was applied and never confirmed healthy, and a
-		// half-written marker is itself a plausible symptom of the crash we are
-		// looking for. Since the attempt count is unrecoverable, the
-		// conservative reading is "an attempt was made and failed": revert to
-		// the known-good generation.
-		return g.revert(nil)
+
+		return Rollback(g, nil)
 	}
 
 	m.Attempts++
-	// maxAttempts is how many post-update starts are tolerated before
-	// reverting. The default of 1 means "the new binary gets exactly one
-	// chance": with it, the first post-update start takes Attempts to 1, which
-	// is not greater than the limit, so it proceeds; if that start never
-	// reaches MarkHealthy, the next one takes Attempts to 2, which exceeds the
-	// limit, and the revert fires.
+
 	maxAttempts := g.MaxAttempts
 	if maxAttempts <= 0 {
 		maxAttempts = 1
 	}
 	if m.Attempts > maxAttempts {
-		return g.revert(&m)
+		return Rollback(g, &m)
 	}
 
-	if err := g.writeMarker(m); err != nil {
+	if err := writeMarker(g, m); err != nil {
 		// The attempt could not be recorded. Proceed rather than fail: an
 		// unwritable state dir must not stop the app from starting.
 		return StartupResult{Marker: &m}, err
@@ -246,61 +233,60 @@ func (g *Guard) CheckStartup() (StartupResult, error) {
 // MarkHealthy clears the marker once startup has completed successfully. It is
 // a no-op when there is no marker, so it is safe to call unconditionally at the
 // end of startup on every run, not just post-update ones.
-func (g *Guard) MarkHealthy() error {
+func MarkHealthy(g *Guard) error {
 	if g.StateDir == "" {
 		return classifyf(ClassInternal, "mark healthy", "no state dir configured")
 	}
-	if err := g.clearMarker(); err != nil {
+	if err := clearMarker(g); err != nil {
 		return classify(ClassOf(err), "mark healthy", err)
 	}
 	return nil
 }
 
-// revert puts the previous generation back and clears the marker. found is the
-// marker that triggered it, or nil if it was unparseable.
-func (g *Guard) revert(found *Marker) (StartupResult, error) {
+// Rollback puts the previous generation back and clears the marker. found is
+// the marker that triggered it, or nil if it was unparseable.
+// GB Rollback should not return anything
+func Rollback(g *Guard, found *Marker) {
+	// Step 1: rename <BinaryPath>.old back onto BinaryPath. g.Restore exists
 	restore := g.Restore
 	if restore == nil {
 		restore = RestoreOld
 	}
-	restoreErr := restore(g.BinaryPath)
-
-	// Clear unconditionally — see CheckStartup on why a surviving marker means
-	// a revert loop.
-	clearErr := g.clearMarker()
-
-	switch {
-	case restoreErr != nil:
-		return StartupResult{Marker: found}, classify(ClassOf(restoreErr), "check startup: revert", restoreErr)
-	case clearErr != nil:
-		return StartupResult{Reverted: true, Marker: found},
-			classify(ClassOf(clearErr), "check startup: clear marker", clearErr)
-	default:
-		return StartupResult{Reverted: true, Marker: found}, nil
+	err := restore(g.BinaryPath)
+	if err != nil {
+		// log error
 	}
+
+	// Step 2: remove the marker file, unconditionally — even if step 1 failed.
+	// GB change func to RemoveFile, pass path args, return an error func, if error, just log an error
+	clearErr := clearMarker(g)
+	if err != nil {
+		// log error
+	}
+
 }
 
 // writeMarker persists m via a temp file plus rename, so a crash mid-write can
 // never leave a partial marker at markerPath.
-func (g *Guard) writeMarker(m Marker) error {
+func writeMarker(g *Guard, m Marker) error {
 	data, err := json.Marshal(m)
 	if err != nil {
 		return classify(ClassInternal, "write marker", err)
 	}
 
-	tmp := g.markerPath() + ".tmp"
+	tmp := markerPath(g) + ".tmp"
 	if err := os.WriteFile(tmp, data, privateFileMode); err != nil {
 		return classify(ClassOf(err), "write marker", err)
 	}
-	if err := os.Rename(tmp, g.markerPath()); err != nil {
+	if err := os.Rename(tmp, markerPath(g)); err != nil {
 		_ = os.Remove(tmp)
 		return classify(ClassOf(err), "write marker: rename", err)
 	}
 	return nil
 }
 
-func (g *Guard) clearMarker() error {
-	if err := os.Remove(g.markerPath()); err != nil && !errors.Is(err, fs.ErrNotExist) {
+func clearMarker(g *Guard) error {
+	if err := os.Remove(markerPath(g)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	return nil
@@ -493,12 +479,7 @@ func (p *Poller) apply(ctx context.Context, target string, d *Decision) error {
 	if err != nil {
 		return err
 	}
-	// Both staging files are removed on every exit — on success they no longer
-	// exist (the download is consumed, the staged binary is renamed onto the
-	// target); on failure this is what stops a partial from being mistaken for
-	// a finished artifact by a later cycle — and that cleanup runs before the
-	// lock is released, so no other instance can observe the half-cleaned state
-	// in between.
+
 	defer func() {
 		os.Remove(compressed)
 		os.Remove(staged)
@@ -538,7 +519,7 @@ func (p *Poller) apply(ctx context.Context, target string, d *Decision) error {
 	}
 
 	// Step 4f: mark pending — recorded after the swap, before relaunch.
-	return p.guard(target).MarkPending(d.CurrentVersion, d.Manifest.Version)
+	return MarkPending(p.guard(target), d.CurrentVersion, d.Manifest.Version)
 }
 
 func (p *Poller) Startup() (StartupResult, error) {
@@ -547,7 +528,7 @@ func (p *Poller) Startup() (StartupResult, error) {
 		return StartupResult{}, err
 	}
 
-	res, err := p.guard(target).CheckStartup()
+	res, err := CheckStartup(p.guard(target))
 	if err != nil {
 		return res, err
 	}
@@ -575,7 +556,7 @@ func (p *Poller) HealthCheck() error {
 	if err != nil {
 		return err
 	}
-	if err := p.guard(target).MarkHealthy(); err != nil {
+	if err := MarkHealthy(p.guard(target)); err != nil {
 		return err
 	}
 
@@ -649,9 +630,6 @@ func (p *Poller) logger() log.Logger {
 	return p.Logger
 }
 
-// logFailure logs an update failure at warn, escalated to error for a tamper
-// signal — the same escalation Reporter.ReportFailure used to apply before
-// telemetry was replaced by local logging.
 func logFailure(logger log.Logger, from, to string, err error) {
 	class := ClassOf(err)
 	lvl := level.Warn

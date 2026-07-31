@@ -72,14 +72,13 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 	// Step 1, before any work that could plausibly crash: reverts and
 	// relaunches if the previous post-update start never got healthy.
-	if _, err := poller.Startup(); err != nil {
-		level.Error(logger).Log("msg", "rollback check", "err", err)
+	if !UpdateSuccessful(poller, logger) {
+		level.Info(logger).Log("msg", "failed to update successful update", "path", poller)
+		selfupdate.Rollback()
 	}
 
-	// === put your application's own startup here ===
-	// Step 2: the application's real startup would go here.
-	level.Info(logger).Log("msg", "starting", "app", appName, "version", selfupdate.Version, "os", selfupdate.PlatformKey())
-	// === end application startup ===
+	// Step 2: the application's real startup.
+	LaunchApp(logger)
 
 	// Step 3, not before: MarkHealthy discards the retained previous binary,
 	// so crash-loop protection depends on it running after startup can fail.
@@ -97,6 +96,28 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		return exitRuntimeError
 	}
 	return exitOK
+}
+
+func UpdateSuccessful(poller *selfupdate.Poller, logger log.Logger) bool {
+	// Startup checks if the previous update failed. If so, it internally:
+	// 1. Restores the .old binary (RestoreOld)
+	// 2. Clears the crash-loop marker
+	// 3. Relaunches into the restored binary (which exits this process via exec)
+	_, err := poller.Startup()
+	if err != nil {
+		level.Error(logger).Log("msg", "rollback check", "err", err)
+		return false
+	}
+	return true
+}
+
+func LaunchApp(logger log.Logger) {
+	level.Info(logger).Log("msg",
+		"starting", "app",
+		appName, "version",
+		selfupdate.Version,
+		"os",
+		selfupdate.PlatformKey())
 }
 
 type setupResult struct {
