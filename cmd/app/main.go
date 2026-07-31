@@ -16,7 +16,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -24,18 +23,20 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"gopkg.in/yaml.v3"
+	"github.com/spf13/viper"
 
 	"self-update/internal/selfupdate"
 )
 
 const appName = "demoapp"
+
+// defaultEnvPath is the default value of the -env flag.
+const defaultEnvPath = ".env.local"
 
 // Exit codes returned by run.
 const (
@@ -54,38 +55,12 @@ func main() {
 	os.Exit(run(ctx, os.Args[1:], os.Stdout, os.Stderr))
 }
 
-// config is loaded from the file named by -demo.
+// config is loaded from the env file named by -env.
 type config struct {
-	ManifestURL string        `yaml:"manifest_url"`
-	Target      string        `yaml:"target"`
-	StateDir    string        `yaml:"state_dir"`
-	Interval    time.Duration `yaml:"interval"`
-	Confirm     bool          `yaml:"confirm"`
-	Insecure    bool          `yaml:"insecure"`
-}
-
-// ReadConfig lets Interval be written as a plain duration string ("1h")
-// in the config file while staying a time.Duration everywhere else.
-func (c *config) ReadConfig(unmarshal func(any) error) error {
-	var raw struct {
-		ManifestURL string `yaml:"manifest_url"`
-		Target      string `yaml:"target"`
-		StateDir    string `yaml:"state_dir"`
-		Interval    string `yaml:"interval"`
-		Confirm     bool   `yaml:"confirm"`
-		Insecure    bool   `yaml:"insecure"`
-	}
-	if err := unmarshal(&raw); err != nil {
-		return err
-	}
-	c.ManifestURL = raw.ManifestURL
-	c.Target = raw.Target
-	c.StateDir = raw.StateDir
-	c.Confirm = raw.Confirm
-	c.Insecure = raw.Insecure
-	c.Interval, _ = time.ParseDuration(raw.Interval)
-
-	return nil
+	ManifestURL string        `mapstructure:"manifest_url"`
+	Target      string        `mapstructure:"target"`
+	StateDir    string        `mapstructure:"state_dir"`
+	Interval    time.Duration `mapstructure:"interval"`
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
@@ -135,18 +110,18 @@ type setupResult struct {
 func setup(args []string, stdout, stderr io.Writer) setupResult {
 	logger := newLogger(stdout)
 
-	demoPath, earlyExit := resolveFlags(args, stdout, stderr, logger)
+	envPath, earlyExit := resolveFlags(args, stdout, stderr, logger)
 	if earlyExit != nil {
 		return *earlyExit
 	}
 
-	cfg, err := loadConfig(demoPath)
+	cfg, err := loadConfig(envPath)
 	if err != nil {
-		level.Error(logger).Log("msg", "loading config", "path", demoPath, "err", err)
+		level.Error(logger).Log("msg", "loading config", "path", envPath, "err", err)
 		return setupResult{logger: logger, code: exitUsageError, exit: true}
 	}
 
-	poller, err := newPoller(cfg, logger, stdout)
+	poller, err := newPoller(cfg, logger)
 	if err != nil {
 		level.Error(logger).Log("msg", "constructing poller", "err", err)
 		return setupResult{logger: logger, code: exitRuntimeError, exit: true}
@@ -161,8 +136,8 @@ func newLogger(stdout io.Writer) log.Logger {
 	return log.With(logger, "ts", log.DefaultTimestampUTC)
 }
 
-func resolveFlags(args []string, stdout, stderr io.Writer, logger log.Logger) (demoPath string, earlyExit *setupResult) {
-	demoPath, printVersion, err := parseFlags(args, stderr)
+func resolveFlags(args []string, stdout, stderr io.Writer, logger log.Logger) (envPath string, earlyExit *setupResult) {
+	envPath, printVersion, err := parseFlags(args, stderr)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return "", &setupResult{logger: logger, code: exitOK, exit: true}
@@ -174,7 +149,7 @@ func resolveFlags(args []string, stdout, stderr io.Writer, logger log.Logger) (d
 		fmt.Fprintf(stdout, "%s %s (%s)\n", appName, selfupdate.Version, selfupdate.PlatformKey())
 		return "", &setupResult{logger: logger, code: exitOK, exit: true}
 	}
-	return demoPath, nil
+	return envPath, nil
 }
 
 // infoLogf adapts a leveled logger to the Poller.Logf callback shape.
@@ -184,25 +159,27 @@ func infoLogf(logger log.Logger) func(string, ...any) {
 	}
 }
 
-func parseFlags(args []string, stderr io.Writer) (demoPath string, printVersion bool, err error) {
+func parseFlags(args []string, stderr io.Writer) (envPath string, printVersion bool, err error) {
 	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	fs.StringVar(&demoPath, "demo", "demo_config.yml", "path to the YAML config file")
+	fs.StringVar(&envPath, "env", defaultEnvPath, "path to the env file")
 	fs.BoolVar(&printVersion, "version", false, "print the version and exit")
 
 	if err := fs.Parse(args); err != nil {
 		return "", false, err
 	}
-	return demoPath, printVersion, nil
+	return envPath, printVersion, nil
 }
 
 func loadConfig(path string) (config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
+	v := viper.New()
+	v.SetConfigFile(path)
+	v.SetConfigType("env")
+	if err := v.ReadInConfig(); err != nil {
 		return config{}, err
 	}
 	var cfg config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := v.Unmarshal(&cfg); err != nil {
 		return config{}, err
 	}
 	if cfg.ManifestURL == "" {
@@ -211,7 +188,7 @@ func loadConfig(path string) (config, error) {
 	return cfg, nil
 }
 
-func newPoller(cfg config, logger log.Logger, stdout io.Writer) (*selfupdate.Poller, error) {
+func newPoller(cfg config, logger log.Logger) (*selfupdate.Poller, error) {
 	logf := infoLogf(logger)
 
 	// First, because everything else is pointless without it.
@@ -233,12 +210,10 @@ func newPoller(cfg config, logger log.Logger, stdout io.Writer) (*selfupdate.Pol
 
 	p := &selfupdate.Poller{
 		Checker: &selfupdate.Checker{
-			ManifestURL:              cfg.ManifestURL,
-			Verifier:                 verifier,
-			InstallID:                installID,
-			UserAgent:                appName + "/" + selfupdate.Version,
-			AllowInsecureManifestURL: cfg.Insecure,
-			AllowInsecureArtifactURL: cfg.Insecure,
+			ManifestURL: cfg.ManifestURL,
+			Verifier:    verifier,
+			InstallID:   installID,
+			UserAgent:   appName + "/" + selfupdate.Version,
 		},
 		Downloader: &selfupdate.Downloader{
 			Progress: func(downloaded, total int64) {
@@ -253,27 +228,5 @@ func newPoller(cfg config, logger log.Logger, stdout io.Writer) (*selfupdate.Pol
 		Logf:       logf,
 		Logger:     logger,
 	}
-	if cfg.Confirm {
-		p.RequireConfirmation = confirmFunc(os.Stdin, stdout)
-	}
 	return p, nil
-}
-
-func confirmFunc(in io.Reader, out io.Writer) func(*selfupdate.Decision) bool {
-	return func(d *selfupdate.Decision) bool {
-		fmt.Fprintf(out, "Update available: %s -> %s. Install now? [y/N] ",
-			d.CurrentVersion, d.Manifest.Version)
-
-		line, err := bufio.NewReader(in).ReadString('\n')
-		if err != nil && line == "" {
-			fmt.Fprintln(out)
-			return false
-		}
-		switch strings.ToLower(strings.TrimSpace(line)) {
-		case "y", "yes":
-			return true
-		default:
-			return false
-		}
-	}
 }

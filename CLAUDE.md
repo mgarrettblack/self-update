@@ -12,15 +12,16 @@ The **release** side (key generation, building, compressing, signing, hosting) i
 separate service this repo does not own. `self-update-design.md` is the spec;
 `README.md` documents the HTTP contract the client expects. The design's `cmd/releaser`
 and `cmd/devserver` (phase 7) are **not implemented**, so producing a signed release
-means the `openssl`/`zstd` recipe below rather than a tool in this repo.
+means hand-rolling one with tools like `openssl` and `zstd` rather than using a tool in
+this repo.
 
 Module path is `self-update` (no domain prefix). Go 1.26.
 
 **There is no test suite.** It was deleted wholesale as the first step of a
 restructuring and its replacement has not landed. Treat `go vet` passing as "it
 compiles", not as "it works", and be correspondingly careful with the invariants below.
-Until the suite is back, changes to the update cycle should be exercised by hand with
-the recipe under "Driving it end to end".
+There is currently no documented way to exercise the update cycle by hand; that gap is
+open until the suite is back.
 
 ## The `docs/` tree
 
@@ -95,78 +96,12 @@ Three are worth reading *before* you touch the thing they describe, not after:
 When you change behaviour, update the doc that owns it — its `**Source of truth:**` line
 names the code it tracks, and the code wins whenever they disagree.
 
-## Commands
-
-```sh
-go build ./... && go vet ./...
-GOOS=windows GOARCH=amd64 go vet ./...   # the only check the Windows path gets
-gofmt -l .                               # must print nothing
-```
-
-Building requires **both** linker flags. A build without them either fails to compare
-versions (`Version` defaults to `0.0.0-dev`, which is valid semver but never newer) or
-refuses to start its updater at all (empty trust set):
-
-```sh
-go build -ldflags "\
-  -X self-update/internal/selfupdate.Version=1.4.2 \
-  -X self-update/internal/selfupdate.TrustedKeysBase64=$PUBKEY" ./cmd/app
-```
 
 `$PUBKEY` is a comma-separated list of standard-base64 Ed25519 public keys. The demo
-app takes a single `-demo <path>` flag (default `demo_config.yml`) naming a YAML file
-with `insecure`, `confirm` and `state_dir` fields for driving it against a
-local release host; `insecure` is the only way to point it at plain HTTP. See
-`demo_config.yml` at the repo root for a commented example, and
+app takes a single `-env <path>` flag (default `.env.local`) naming a dotenv file with
+`manifest_url`, `target`, `state_dir` and `interval` fields for driving it against a
+release host. See `.env.local` at the repo root for a commented example, and
 [docs/architecture/cmd-app.md](docs/architecture/cmd-app.md) for the full field table.
-
-### Driving it end to end
-
-The repo has no releaser, but `openssl` and `zstd` are enough to fabricate a release
-the client genuinely accepts. This is the only way to exercise the happy path right
-now, and it is worth doing for any change to the update cycle:
-
-```sh
-openssl genpkey -algorithm ed25519 -out /tmp/sk.pem
-PUB=$(openssl pkey -in /tmp/sk.pem -pubout -outform DER | tail -c 32 | base64)
-LD="-X self-update/internal/selfupdate.TrustedKeysBase64=$PUB"
-
-mkdir -p /tmp/host /tmp/install
-go build -o /tmp/install/demoapp -ldflags "-X self-update/internal/selfupdate.Version=1.0.0 $LD" ./cmd/app
-go build -o /tmp/new             -ldflags "-X self-update/internal/selfupdate.Version=9.9.9 $LD" ./cmd/app
-zstd -q -f /tmp/new -o /tmp/host/a.zst
-
-SHA=$(shasum -a 256 /tmp/host/a.zst | cut -d' ' -f1); SZ=$(stat -f%z /tmp/host/a.zst)
-printf '{"version":"9.9.9","rollout":100,"platforms":{"%s":{"url":"http://127.0.0.1:8099/a.zst","sha256":"%s","size":%s}}}' \
-  "$(go env GOOS)-$(go env GOARCH)" "$SHA" "$SZ" > /tmp/host/manifest.json
-openssl pkeyutl -sign -inkey /tmp/sk.pem -rawin -in /tmp/host/manifest.json | base64 > /tmp/host/manifest.json.sig
-# demo_manifest.json at the repo root shows this same schema as a static, unsigned
-# reference — the recipe generates its own so the hash/size match the real build.
-
-cat > /tmp/host/demo_config.yml <<'CFG'
-manifest_url: http://127.0.0.1:8099/manifest.json
-state_dir: /tmp/st
-target: /tmp/install/demoapp
-insecure: true
-CFG
-
-python3 -m http.server 8099 --directory /tmp/host &
-/tmp/install/demoapp -demo /tmp/host/demo_config.yml
-```
-
-The demo polls for the life of the process, so it will not exit on its own — interrupt
-it (Ctrl+C) once the expected log line appears, then inspect state.
-
-Expect `updated 1.0.0 to 9.9.9` followed by the successor process starting, no `.old`
-/`.download`/`.new` left in `/tmp/install`, and no marker in `/tmp/st`.
-
-The failure paths are the ones most worth re-checking, because they are the ones that
-fail silently if broken. Flipping a byte in `a.zst` after signing must give
-`hash_mismatch`; editing `manifest.json` after signing must give `signature_invalid`;
-removing `manifest.json.sig` must fail rather than proceed unsigned; and setting
-`insecure: false` (or omitting it) must be refused on scheme. In all four the target
-binary must be left at 1.0.0 — interrupt the process once the failure is logged; it
-will otherwise retry on the next jittered interval rather than exiting.
 
 ## Architecture
 
@@ -227,73 +162,3 @@ Invariants that constrain any change to this sequence:
 5. **Marker after the swap, before the relaunch.** Earlier fires a revert for an update
    that never happened; later never runs at all, because unix `Relaunch` does not return.
 6. **Telemetry is drained before the relaunch**, for the same reason.
-
-### Fail-closed points
-
-- `TrustedVerifier()` errors on an empty trust set instead of returning a permissive
-  verifier — the alternative is an RCE vector.
-- `Checker.Check` refuses to touch the network with a nil `Verifier`.
-- A missing `.sig` (404) is a failure, never a licence to treat the manifest as unsigned.
-- Non-HTTPS URLs are rejected unless explicitly waived; the manifest and artifact
-  switches are independent.
-- Public keys are compile-time only (`release.go`). Never read a trust anchor from config,
-  env or the network. `bakedInTrustedKeys` carries the four-step rotation procedure in
-  its doc comment — the fleet must trust a new key *before* the service signs with it.
-
-### Errors and telemetry
-
-Every failure is tagged with an `ErrorClass` (`errors.go`) via `classify`/`classifyf`;
-`ClassOf` infers one from syscall/net errors when untagged, defaulting to
-`ClassInternal` so a mis-inference never fakes a tamper signal. Only the class is ever
-reported upstream — raw error strings contain paths and usernames.
-`signature_invalid` and `hash_mismatch` are `IsTamperSignal()` and escalate to
-`SeverityAlert`. Telemetry is fire-and-forget and fully optional (nil `Reporter`).
-
-New error paths should be classified, and telemetry `Event` fields must stay
-enumerations or version strings — nothing free-form.
-
-## Conventions
-
-- **Comments carry the reasoning, not the mechanics.** This codebase explains *why* a
-  choice was made and what breaks otherwise (see `fs_unix.go` on rename-over-running-
-  executable, `update.go` on attempt accounting, `constants.go` on the space safety
-  margin). Match that register; don't strip these when refactoring.
-- `§N` in a comment references a numbered section of `self-update-design.md`.
-- `// GB ...` comments are the repo owner's pending refactor notes, not documentation.
-  Leave them unless you are doing the refactor they ask for.
-- **No function exists only to forward to another.** Single-call-site wrappers were
-  removed deliberately; when you inline one, its doc comment moves to the point of use
-  rather than being dropped. The counter-pressure is a rough 70-line ceiling: if an
-  inline would push a function past that, don't do it. `Downloader.attempt` is over the
-  ceiling on purpose — it is one switch over HTTP statuses, and every way of splitting
-  it recreates the helpers this layout exists to avoid.
-- **Tunables live in `constants.go`**, grouped by layer, each keeping its full rationale
-  comment. Enum values (`ClassNetwork`, `OutcomeSuccess`, `SeverityInfo`) stay with their
-  type declarations — they are the type, not a tunable. Platform-only constants
-  (`binaryMode`, `brokenSuffix`, `lockRegionLength`, `RelaunchReplacesProcess`) stay in
-  the platform files.
-- One platform split, `fs_unix.go` / `fs_windows.go`, with `//go:build` tags. Platform
-  behaviour is injected through package vars (`execProcess`, `linkFile`) or struct fields
-  (`Guard.Restore`, `Poller.Relaunch`) so the logic around it stays testable on any host.
-  Those seams are worth keeping even with no tests present — they are what makes the
-  Windows path reviewable from a Mac.
-- Optional struct fields are zero-value-meaningful (`Interval` 0 → 1h, `MaxAttempts`
-  0 → 1, nil `Logf` → discard). Follow that rather than adding constructors.
-- When the suite comes back: real HTTP servers, real zstd, real Ed25519, real file swaps
-  and real locks — not mocks. One behaviour per test, named as a sentence
-  (`TestCheckTreatsMissingSignatureAsFailureNotAsUnsigned`). Release-side fixtures must
-  not import `selfupdate`, or a fixture built with the client's own writers can agree
-  with the client's own readers about an encoding the real service never emits.
-
-## Known gaps
-
-The Windows swap (the `fs_windows.go` rename dance with its `.broken` fallback) and the
-spawn-and-exit relaunch have no coverage at all — not even the logic tests they used to
-have. Their real filesystem behaviour under a running executable needs a Windows CI
-runner, which does not exist here; `GOOS=windows go vet` is the whole safety net.
-
-More broadly, nothing is verified automatically. The happy path and the four
-fail-closed paths have been walked by hand on darwin/arm64 with the recipe above, which
-is evidence that they worked at one point on one platform — not a regression test. See
-the "no test suite" note at the top: this is the largest thing wrong with the
-repository right now, and it is deliberate and temporary rather than an oversight.
